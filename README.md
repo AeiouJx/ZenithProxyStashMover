@@ -1,75 +1,150 @@
-# ZenithProxy Example Plugin
+# ZenithProxy StashMover
 
-[ZenithProxy](https://github.com/rfresh2/ZenithProxy) is a Minecraft proxy and bot.
+A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that moves cargo between two
+endpoints — any distance, any dimension — by chaining ender-pearl static chambers and a
+whispered loader bot.
 
-This repository is an example core plugin for ZenithProxy, allowing you to add custom modules and commands.
+One bot cycles back and forth forever:
 
-## Installing Plugins
+- **Input side (pickup)** — take items from the pickup chest, stash them in an ender chest,
+  fill the main inventory, then get pulled to the output side.
+- **Output side (unload)** — deposit the cargo, then get pulled back to the pickup side.
 
-Plugins are only supported on the `java` ZenithProxy release channel (i.e. not `linux`).
+## How it works
 
-Place plugin jars in the `plugins` folder inside the same folder as the ZenithProxy launcher.
+A static chamber is a shaft built around a bubble column with a trapdoor on top. Throw an ender
+pearl straight down and it sinks, floats back up and parks itself on the trapdoor. A player
+standing next to the chamber can then touch that pearl and get teleported to it.
 
-Restart ZenithProxy to load plugins. Loading plugins after launch or hot reloading is not supported.
+StashMover uses this in both directions:
 
-## Creating Plugins
+1. Walk to the chamber, open its trapdoor, sneak to the centre and throw a pearl straight down.
+2. Retreat along the trapdoor's facing side until the pearl has stopped sinking and the bot is
+   clear of the shaft.
+3. Do the cargo work at that side.
+4. Whisper the loader bot on the *other* side (`/w <username> tp`). It touches its own chamber's
+   pearl and pulls this bot across.
+5. Repeat.
 
-Use this repository as a template to create your own plugin repository.
+If the pull lands the bot in the wrong chamber, it restocks that chamber on the way past before
+heading to the configured one, so the loader always has a loaded pearl to work with.
 
-### Plugin Structure
+## Requirements
 
-Each plugin needs a main class that implements `ZenithProxyPlugin` and is annotated with `@Plugin`.
+- Java 21+
+- [ZenithProxy](https://github.com/rfresh2/ZenithProxy) on the `java` release channel
+  (plugins are not supported on `linux`)
+- Two static chambers, one per side, each built around a bubble column with an openable trapdoor
+- Two loader bots, one standing at each chamber
+- Optionally an ender chest and a pearl restock chest near each side
 
-Plugin metadata like its unique id, version, and supported MC versions is defined in the `@Plugin` annotation.
+## Installation
 
-[See example](https://github.com/rfresh2/ZenithProxyExamplePlugin/blob/1.21.4/src/main/java/org/example/ExamplePlugin.java)
+1. Download the jar from the [releases page](../../releases).
+2. Copy it into the `plugins` folder next to the ZenithProxy launcher.
+3. Start ZenithProxy. Plugins are loaded at startup — hot reloading is not supported.
 
-### Plugin API
+## Setup
 
-The `ZenithProxyPlugin` interface requires you to implement an `onLoad` method.
+All coordinates are optional. Anything left unset is auto-detected at runtime from marker item
+frames, which are placed next to the block they label:
 
-This method provides a `PluginAPI` object that you can use to register modules, commands, and config files.
+| Marker item frame next to | Detects |
+|---|---|
+| redstone dust | the pickup chest (`inputChest`) |
+| redstone block | the unload chest (`outputChest`) |
+| ender pearl, with a trapdoor 1–2 blocks below | the pearl pit (`inputPearl` / `outputPearl`) |
+| ender pearl, attached to a container | the pearl restock chest (`inputPearlChest` / `outputPearlChest`) |
 
-`Module` and `Command` classes are implemented the same as in the ZenithProxy source code.
+The two loader bot usernames are the only required setting.
 
-I recommend looking at existing modules, commands, and plugins for examples.
+```
+/sm inputBot <name>          loader bot standing at the pickup side
+/sm outputBot <name>         loader bot standing at the unload side
+/sm inputChest <x> <y> <z>
+/sm outputChest <x> <y> <z>
+/sm inputPearl <x> <y> <z>
+/sm outputPearl <x> <y> <z>
+/sm inputPearlChest <x> <y> <z>
+/sm outputPearlChest <x> <y> <z>
+```
 
-* [Module](https://github.com/rfresh2/ZenithProxy/tree/1.21.4/src/main/java/com/zenith/module)
-* [Command](https://github.com/rfresh2/ZenithProxy/tree/1.21.4/src/main/java/com/zenith/command)
-* Plugins
-  * [ZenithProxyVillagerTrader](https://github.com/rfresh2/ZenithProxyVillagerTrader)
-  * [ZenithProxyWebAPI](https://github.com/rfresh2/ZenithProxyWebAPI)
-  * [ZenithProxyChatControl](https://github.com/rfresh2/ZenithProxyChatControl)
-  * More in [my discord server](https://discord.com/channels/1127460556710883391/1369081651564515358)
+Coordinates can be entered by pointing at a block and pressing <kbd>TAB</kbd> in game.
+`<key> clear` resets a value back to auto-detection. Changes apply immediately — no restart.
 
-### JavaDocs
+Then start the cycle:
 
-https://maven.2b2t.vc/javadoc/releases/com/zenith/ZenithProxy/1.21.4-SNAPSHOT
+```
+/sm start
+```
 
-### Building Plugins
+## Commands
 
-Execute the Gradle `build` task: `./gradlew build` - or double-click the task in Intellij
+| Command | Description |
+|---|---|
+| `/sm start` / `/sm stop` | start / stop the cycle |
+| `/sm status` | show the current state and configuration |
+| `/sm debug [on\|off\|info]` | toggle verbose logging / print runtime debug info |
+| `/sm restockBelow [count]` | pearl count below which a restock is triggered (default 16) |
+| `/sm bulkDelay [ticks]` | delay between each of the 27 slot moves when bulk transferring (0 = all in one tick) |
+| `/sm <key> clear` | clear a coordinate and re-enable auto-detection |
 
-The built plugin jar will be in the `build/libs` directory.
+## Configuration
 
-### Testing Plugins
+Written to `plugins/config/stash-mover.json`.
 
-Execute the `run` task: `./gradlew run` - or double-click the task in Intellij
+| Key | Default | Description |
+|---|---|---|
+| `minPearls` | 8 | pearl count below which a restock is triggered |
+| `restockBeforeThrowBelow` | 16 | restock while standing outside the pit once the count drops below this |
+| `restockPearlStacks` | 9 | upper bound on stacks per restock; the real count is the free hotbar slots |
+| `restockMaxDistance` | 256 | skip the restock if the pearl chest is further away than this |
+| `echestSearchRadius` | 16 | radius for finding the nearest ender chest |
+| `frameScanRadius` | 32 | radius for scanning marker item frames |
+| `frameChestMaxDistance` | 2 | max distance between a marker frame and the block it labels |
+| `interactRange` | 4 | interaction range for containers and trapdoors |
+| `tpDetectDistance` | 8 | coordinate jump that counts as a successful teleport |
+| `teleportSettleTicks` | 60 | ticks to wait after a teleport lands |
+| `pathTimeoutTicks` | 1200 | pathfinding timeout |
+| `teleportTimeoutTicks` | 600 | teleport wait timeout |
+| `bulkTransferDelayTicks` | 0 | ticks between slot moves during a bulk transfer |
+| `autoDisableOnEmpty` | true | halt when the pickup chest is found empty |
+| `debug` | false | verbose logging |
 
-This will run ZenithProxy with your plugin loaded in the `run` directory.
+### Pearl restocking
 
-### New Plugin Checklist
+Restocking happens while the bot is still outside the chamber, because the pearl chest sits a
+few blocks away and is only reachable from there — waiting until the pearls run out means finding
+out with an empty inventory while already wedged in the shaft. Each restock takes enough stacks to
+fill the free hotbar slots and returns anything that does not fit back to the chest, so the main
+inventory stays clear for actual cargo.
 
-1. Edit `gradle.properties`:
-   - `plugin_name` - Name of your plugin, shown to users and in the plugin jar file name (e.g. `ExamplePlugin`)
-   - `plugin_id` - Unique identifier for your plugin (e.g. `example-plugin`)
-     - Must start with a lowercase letter and contain only lowercase letters, numbers, or dashes (`-`)
-   - `mc` - MC version of ZenithProxy your plugin is compiled for (e.g. `1.21.4`)
-   - `maven_group` - Java package for your project (e.g. `com.github.rfresh2`)
-1. Move files to your new corresponding package / maven group:
-   - Example: `src/main/java/org/example` -> `src/main/java/com/github/rfresh2`
-   - First create the new package in `src/main/java`. Then click and drag original subpackages/classes to your new one
-   - Do this with Intellij to avoid manually editing all the source files
-   - You must also create and move package folders for the `src/main/templates` folder
-1. Edit `ExamplePlugin.java`, or remove it and create a new main class
-   - Make sure to update the `@Plugin` annotation
+## Safety notes
+
+- Trapdoors are only ever **right-clicked**, never mined.
+- The bot never throws a pearl into a chamber that already holds one, whether that pearl is its
+  own or somebody else's.
+- After a pull the bot steps out of the shaft *before* doing anything else, and stops if it
+  cannot find its way out rather than forcing the trapdoor.
+- The module idles completely while the bot is in the queue server.
+
+## Building
+
+```
+./gradlew shadowJar
+```
+
+The jar is written to `build/libs/`.
+
+## Disclaimer
+
+This plugin automates a game client. Use it only on servers and accounts where automation is
+permitted, and at your own risk.
+
+## License
+
+Released under the **GNU Affero General Public License v3.0 or later** — the same license as
+ZenithProxy itself, which this plugin links against. See [LICENSE](LICENSE).
+
+If you run a modified version of this plugin as a network service, you must offer its source
+code to your users, as required by AGPL-3.0 section 13.

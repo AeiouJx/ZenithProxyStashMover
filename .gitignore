@@ -36,3 +36,6 @@ dataGenerator/run
 
 # Ignore Gradle build output directory
 build
+
+# Internal design/development notes - not part of the public repository
+DESIGN.md
