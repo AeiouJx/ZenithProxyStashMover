@@ -6,7 +6,7 @@
 *.yml text=auto eol=lf
 *.template text=auto eol=lf
 *.txt text=auto eol=lf
-*.bat text eol=crlf
+*.bat -text
 *.gradle text=auto eol=lf
 *.sh text=auto eol=lf
 *.html text=auto eol=lf
