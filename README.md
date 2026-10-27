@@ -19,13 +19,19 @@ standing next to the chamber can then touch that pearl and get teleported to it.
 StashMover uses this in both directions:
 
 1. Walk to the chamber and stand on the block just outside the pit on the trapdoor's facing
-   side, open the trapdoor, sneak to the centre and throw a pearl straight down.
-2. Retreat along the trapdoor's facing side until the pearl has stopped sinking and the bot is
-   clear of the shaft.
+   side, open the trapdoor, sneak in toward the centre and throw a pearl straight down. The bot
+   keeps leaning in until it is close to the middle of the column instead of dropping the pearl
+   the moment the pit is under its feet.
+2. Stay put until the pearl has sunk to the bottom of the shaft and been lifted about a block
+   back up, then hop out along the trapdoor's facing side. That facing side is tried first; the
+   sideways directions are only used if the bot cannot get clear that way.
 3. Do the cargo work at that side.
-4. Whisper the loader bot on the *other* side (`/w <username> tp`). It touches its own chamber's
-   pearl and pulls this bot across.
-5. Repeat.
+4. Before whispering, confirm this side's chamber still holds one of the bot's own pearls and
+   throw one back in if it does not, so the loader bot has something to pull with later.
+5. Whisper the loader bot on the *other* side (`/w <username> tp`). It touches its own chamber's
+   pearl and pulls this bot across. If the loader never answers, the whisper is sent again after
+   `whisperReplyTimeoutTicks`.
+6. Repeat.
 
 If the pull lands the bot in a neighbouring chamber instead of the configured pit - most sides
 have two - it recognises the bubble column it is standing in, climbs out through that chamber's
@@ -111,6 +117,7 @@ Written to `plugins/config/stash-mover.json`.
 | `teleportSettleTicks` | 60 | ticks to wait after a teleport lands |
 | `pathTimeoutTicks` | 1200 | pathfinding timeout |
 | `teleportTimeoutTicks` | 600 | teleport wait timeout |
+| `whisperReplyTimeoutTicks` | 200 | ticks to wait for the loader bot to answer before whispering again |
 | `bulkTransferDelayTicks` | 0 | ticks between slot moves during a bulk transfer |
 | `autoDisableOnEmpty` | true | halt when the pickup chest is found empty |
 | `debug` | false | verbose logging |
@@ -128,6 +135,10 @@ inventory stays clear for actual cargo.
 - Trapdoors are only ever **right-clicked**, never mined.
 - The bot never throws a pearl into a chamber that already holds one, whether that pearl is its
   own or somebody else's.
+- Before asking for a pull it re-checks that its own pearl is still in this side's chamber and
+  throws one back in if it is missing, so a round never ends with an unusable chamber.
+- If the loader bot does not answer the pull whisper, the whisper is repeated a few times before
+  the run is aborted as an error.
 - After a pull the bot steps out of the shaft *before* doing anything else, and stops if it
   cannot find its way out rather than forcing the trapdoor.
 - The module idles completely while the bot is in the queue server.

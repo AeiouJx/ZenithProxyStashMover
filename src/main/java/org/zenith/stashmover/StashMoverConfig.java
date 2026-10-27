@@ -98,6 +98,11 @@ public class StashMoverConfig {
     public int pathTimeoutTicks = 1200;
     /** Teleport wait timeout (ticks) */
     public int teleportTimeoutTicks = 600;
+    /**
+     * Ticks to wait for the loader bot to answer the pull whisper before whispering again.
+     * Only covers "no answer at all" - once it has answered we wait out the teleport timeout.
+     */
+    public int whisperReplyTimeoutTicks = 200;
     /** Debug logging enabled */
     public boolean debug = false;
     /** Ticks between each action when bulk-transferring 27 slots to/from a container.

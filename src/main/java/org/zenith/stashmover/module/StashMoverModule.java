@@ -22,6 +22,8 @@ import com.zenith.Proxy;
 import com.zenith.cache.data.entity.Entity;
 import com.zenith.cache.data.inventory.Container;
 import com.zenith.event.client.ClientBotTick;
+import com.zenith.event.chat.PublicChatEvent;
+import com.zenith.event.chat.WhisperChatEvent;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.inventory.actions.CloseContainer;
@@ -79,12 +81,14 @@ public class StashMoverModule extends Module {
     private static final int MOVE_PRIORITY = 10000;
     private static final int INV_PRIORITY = 10000;
     private static final int MAX_TP_RETRIES = 3;
-    /** Ticks to wait after pearl confirmation before starting the retreat */
-    /** Ticks between confirming the pearl and stepping into RETREAT - just long enough to
-     *  release the right-click. Lingering here is what lets the rising pearl hit us. */
-    private static final int THROW_FINISH_TICKS = 2;
+    /** How many times we re-throw before whispering with an empty chamber behind us */
+    private static final int MAX_WHISPER_REPAIRS = 2;
     /** Max ticks to wait for a newly thrown pearl to appear before re-throwing */
     private static final int THROW_DETECT_TICKS = 120;
+    /** How far a pearl has to rise off its lowest point before we hop away (one block) */
+    private static final double PEARL_RISE_ONE_BLOCK = 1.0;
+    /** Max ticks to watch the pearl sink and start rising before retreating anyway */
+    private static final int THROW_SINK_TIMEOUT_TICKS = 120;
     private static final int MAX_THROW_RETRIES = 3;
     /** Distance (blocks) the sneak-in must gain on the pit before the stall counter resets */
     private static final double CREEP_PROGRESS_EPS = 0.05;
@@ -92,6 +96,13 @@ public class StashMoverModule extends Module {
     private static final int CREEP_HOLD_TICKS = 45;
     /** How many times we may restart the sneak-in before giving up on lining up */
     private static final int MAX_CREEP_ATTEMPTS = 3;
+    /** Distance from the pit centre (0.30 blocks) at which a throw counts as well centred */
+    private static final double THROW_CENTER_SQ = 0.09;
+    /**
+     * Ticks the sneak-in may stay pinned by the lid/trapdoor box before we throw from an
+     * off-centre spot. Without it a bot whose feet are wedged would never throw at all.
+     */
+    private static final int CREEP_CENTER_HOLD_TICKS = 60;
     /** Fruitless pearl restock cycles before halting instead of looping THROWING <-> RESTOCK */
     private static final int MAX_FAILED_RESTOCKS = 2;
     /**
@@ -107,8 +118,8 @@ private static final int PIT_SHAFT_DEPTH = 8;
      * After those the bot gives up on walking and clicks the trapdoor where it stands.
      */
     private static final int STEP_OFF_PHASES = 12;
-    /** Yaws tried when hopping off a shut trapdoor: south, west, north, east */
-    private static final float[] HOP_YAWS = {0f, 90f, 180f, -90f};
+    /** Extra yaw offsets tried after the trapdoor facing when hopping off a shut trapdoor */
+    private static final float[] HOP_SIDE_OFFSETS = {90f, 180f, -90f};
     /** Ticks of hand-driven hopping used to shake baritone loose when pathing stalls */
     private static final int SHAKE_OFF_TICKS = 12;
     /** Close enough to the stand cell next to the pit that the sneak-in can start (0.6 blocks) */
@@ -185,6 +196,9 @@ private static final int PIT_SHAFT_DEPTH = 8;
     private int rethrowCount = 0;
     /** Entity ID of the pearl found by pearlRestingInPit() */
     private int lastFoundPearlId = -1;
+    /** Lowest Y the freshly thrown pearl has reached, for "sank, then floated back up" */
+    private double pearlLowestY = 0.0;
+    private boolean pearlSinkInit = false;
     /** Whether the cargo log message has been printed for the current CARGO session */
     private boolean cargoLogged = false;
     /** Consecutive MOVE_TO_THROW path failures (survives state transitions) */
@@ -259,6 +273,14 @@ private static final int PIT_SHAFT_DEPTH = 8;
     private int restockFailCount = 0;
     /** Logged once while we wait for the bot to land next to one of the two stashes */
     private boolean waitingForSideLogged = false;
+    /** Loader bot we whispered for the pull (lower case), empty when not waiting for one */
+    private String whisperTarget = "";
+    /** True once the loader bot answered that whisper - after that we only wait for the pull */
+    private boolean loaderReplied = false;
+    /** Re-throws done to stock this side's chamber before whispering for the pull */
+    private int whisperRepairAttempts = 0;
+    /** Set while the current throw was started only to restock the chamber before a whisper */
+    private boolean whisperRepairPending = false;
     /** Remaining ticks of hand-driven hopping to shake baritone loose */
     private int shakeOffTicks = 0;
     /**
@@ -284,7 +306,9 @@ private static final int PIT_SHAFT_DEPTH = 8;
         return List.of(
             of(ClientBotTick.class, this::onTick),
             of(ClientBotTick.Starting.class, e -> reset()),
-            of(ClientBotTick.Stopped.class, e -> reset())
+            of(ClientBotTick.Stopped.class, e -> reset()),
+            of(WhisperChatEvent.class, this::onWhisper),
+            of(PublicChatEvent.class, this::onPublicChat)
         );
     }
 
@@ -303,6 +327,36 @@ private static final int PIT_SHAFT_DEPTH = 8;
             BARITONE.stop();
         } catch (Exception ignored) { }
         setState(MoverState.IDLE);
+    }
+
+    /**
+     * Whispers from the loader bot count as an answer to the pull request. The content does not
+     * matter - pearl bots answer with "tp", "ok" or just noise - only that it heard us, which is
+     * what tells the wait loop not to send the same whisper again.
+     */
+    private void onWhisper(WhisperChatEvent event) {
+        if (event.outgoing() || whisperTarget.isEmpty()) return;
+        var sender = event.sender();
+        if (sender == null || !whisperTarget.equalsIgnoreCase(sender.getName())) return;
+        onLoaderReply("whisper", event.message());
+    }
+
+    /** Some pearl bots answer in public chat instead of whispering back - accept that too. */
+    private void onPublicChat(PublicChatEvent event) {
+        if (whisperTarget.isEmpty() || state != MoverState.AWAIT_TELEPORT) return;
+        var sender = event.sender();
+        if (sender == null || !whisperTarget.equalsIgnoreCase(sender.getName())) return;
+        onLoaderReply("public chat", event.message());
+    }
+
+    private void onLoaderReply(String kind, String message) {
+        String msg = message == null ? "" : message;
+        if (msg.length() > 120) msg = msg.substring(0, 120) + "...";
+        if (!loaderReplied) {
+            info("{} answered our pull whisper ({}) - waiting for the pull", whisperTarget, kind);
+        }
+        dbg("loader reply: {}", msg);
+        loaderReplied = true;
     }
 
     /**
@@ -343,6 +397,11 @@ private static final int PIT_SHAFT_DEPTH = 8;
         errorHandled = false;
         lastNearThrow = false;
         standApproachFailed = false;
+        pearlSinkInit = false;
+        whisperTarget = "";
+        loaderReplied = false;
+        whisperRepairAttempts = 0;
+        whisperRepairPending = false;
         creepStuckTicks = 0;
         creepInit = false;
         riseStuckTicks = 0;
@@ -404,6 +463,12 @@ private static final int PIT_SHAFT_DEPTH = 8;
         trapdoorApproachInit = false;
         trapdoorApproachStall = 0;
         waitingForSideLogged = false;
+        if (s == MoverState.MOVE_TO_THROW) {
+            // the sneak-in stall counter is only meaningful within one approach
+            creepStuckTicks = 0;
+            creepInit = false;
+            creepBestDist = Double.MAX_VALUE;
+        }
         logSnapshot(s);
     }
 
@@ -635,6 +700,11 @@ private static final int PIT_SHAFT_DEPTH = 8;
         hasRetreatPrev = false;
         pearlIdsBeforeThrow.clear();
         standApproachFailed = false;
+        pearlSinkInit = false;
+        whisperTarget = "";
+        loaderReplied = false;
+        whisperRepairAttempts = 0;
+        whisperRepairPending = false;
         setState(MoverState.EVAL_SIDE);
     }
 
@@ -1153,6 +1223,17 @@ private int[] arrivalChamber() {
                     setState(MoverState.RETREAT);
                     return;
                 }
+                // Being over the column is not the same as being over its middle: lean toward the
+                // centre for as long as the guard lets us before the pearl is dropped. Inside the
+                // column itself there is nothing to lean in from - and pressing forward while
+                // floating there can push us back out of the bubble column - so hold and throw.
+                if (!botInPitColumn()) {
+                    trackCreepProgress(Math.sqrt(horizSq));
+                    if (!throwCentered() && creepStuckTicks <= CREEP_CENTER_HOLD_TICKS) {
+                        submitInput(Input.builder().pressingForward(true).sneaking(true).build(), pitFacingYaw(), 0f);
+                        return;
+                    }
+                }
                 moveToThrowRetries = 0;
                 creepStuckTicks = 0;
                 creepInit = false;
@@ -1186,37 +1267,32 @@ private int[] arrivalChamber() {
             // guard shove us back, so the bot oscillates by a few centimetres forever and a
             // delta based counter would be reset on every single tick - that is the jitter.
             double creepDist = Math.sqrt(horizSq);
-            if (!creepInit) {
-                creepInit = true;
-                creepBestDist = creepDist;
-            } else if (creepDist < creepBestDist - CREEP_PROGRESS_EPS) {
-                // genuinely got closer: reset the stall counter and remember the new best
-                creepBestDist = creepDist;
-                creepStuckTicks = 0;
-            } else {
-                // sideways jitter / being pushed back is NOT progress
-                creepStuckTicks++;
-            }
-            // the sneak edge guard stopped us: we are as close as we can get, so if the
-            // pearl can still fall in from here, stop creeping and throw
-            if (creepStuckTicks > 15 && pearlWouldFallIn()) {
-                info("Sneak creep hit the edge guard, throwing from here | hDist={}",
-                    String.format("%.2f", Math.sqrt(horizSq)));
-                setState(MoverState.THROWING);
-                return;
-            }
-            // The sneak edge guard pins the bot's centre a few tenths short of the pit column and
-            // will not let it go further. That is close enough to throw from: stop dead,
-            // do NOT back off, just verify the view is on the pit and throw.
-            if (creepStuckTicks > 5) {
-                submitInput(Input.builder().build(), pitFacingYaw(), 90f);
-                if (readyToThrow()) {
-                    info("Creep stopped at the edge guard, throwing from here | hDist={}",
+            trackCreepProgress(creepDist);
+            // Just being over the column's edge is not good enough: the pearl drops straight down
+            // from the eyes, so keep leaning in until we are close to the middle - it should land
+            // in the centre of the chamber, not against a wall. Only when leaning in has clearly
+            // stopped helping (the lid/trapdoor box pins the feet and the server rejects any
+            // further movement) do we throw from where we got stuck.
+            if (pearlWouldFallIn()) {
+                if (throwCentered() || creepStuckTicks > CREEP_CENTER_HOLD_TICKS) {
+                    info("Throw position centred or pinned, throwing from here | hDist={}",
                         String.format("%.2f", creepDist));
                     creepAttempts = 0;
                     setState(MoverState.THROWING);
                     return;
                 }
+                submitInput(Input.builder().pressingForward(true).sneaking(true).build(), pitFacingYaw(), 0f);
+                return;
+            }
+            // The view is not on the pit yet. Stop dead, look straight down and re-check instead of
+            // grinding the guard - and if that does not line us up either, back off and sneak in
+            // again from a fresh run.
+            if (creepStuckTicks <= 5) {
+                submitInput(Input.builder().pressingForward(true).sneaking(true).build(), pitFacingYaw(), 0f);
+                return;
+            }
+            {
+                submitInput(Input.builder().build(), pitFacingYaw(), 90f);
                 if (creepStuckTicks == 6) {
                     info("Creep blocked at hDist={}, standing still and checking the view",
                         String.format("%.2f", creepDist));
@@ -1243,8 +1319,6 @@ private int[] arrivalChamber() {
                 }
                 return;
             }
-            submitInput(Input.builder().pressingForward(true).sneaking(true).build(), pitFacingYaw(), 0f);
-            return;
         }
         // far: baritone walks to the PIT itself - it parks the bot on a standable cell right
         // next to the hole, which is exactly the spot we then sneak in from
@@ -1495,6 +1569,41 @@ private int[] arrivalChamber() {
      */
     private boolean readyToThrow() {
         return nearThrowPos();
+    }
+
+    /** Horizontal distance in blocks from the bot to the pit centre. */
+    private double pitCenterDist() {
+        var p = CACHE.getPlayerCache();
+        double dx = p.getX() - (currentPit[0] + 0.5);
+        double dz = p.getZ() - (currentPit[2] + 0.5);
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    /**
+     * Close enough to the pit centre that the pearl lands in the middle of the chamber instead
+     * of against a wall. Deliberately stricter than {@link #nearThrowPos()}: touching the
+     * column's edge makes the drop legal, it does not make it a well-placed throw.
+     */
+    private boolean throwCentered() {
+        double d = pitCenterDist();
+        return d * d <= THROW_CENTER_SQ;
+    }
+
+    /**
+     * Track how long the sneak-in has been stuck. Progress is net gain toward the pit centre,
+     * not per-tick movement: pressing forward into the edge guard makes the guard shove the bot
+     * back every tick, so a per-tick check would see "progress" forever.
+     */
+    private void trackCreepProgress(double creepDist) {
+        if (!creepInit) {
+            creepInit = true;
+            creepBestDist = creepDist;
+        } else if (creepDist < creepBestDist - CREEP_PROGRESS_EPS) {
+            creepBestDist = creepDist;
+            creepStuckTicks = 0;
+        } else {
+            creepStuckTicks++;
+        }
     }
 
     /** First non-air block straight below the eyes, skipping trapdoors. Null if none. */
@@ -1860,7 +1969,7 @@ private boolean inPitFootprint() {
                 trapdoorStepOffTicks = STEP_OFF_PHASES * STEP_OFF_DIRECTION_TICKS;
                 // fall through to the click logic
             } else {
-                float yaw = HOP_YAWS[phase % HOP_YAWS.length];
+                float yaw = hopYaws()[phase % 4];
                 boolean back = phase >= 4 && phase < 8;
                 boolean sneak = phase >= 8;
                 Input.Builder builder = Input.builder().jumping(true);
@@ -2125,6 +2234,7 @@ private boolean inPitFootprint() {
             pearlStayTicks = 0;
             retreatStableTicks = 0;
             pearlRiseInit = false;
+            pearlSinkInit = false;
             awaitThrowSettleTimer.reset();
             setState(MoverState.AWAIT_THROW_SETTLE);
             return;
@@ -2145,14 +2255,42 @@ private boolean inPitFootprint() {
     }
 
     /**
-     * Let go of the right-click for a couple of ticks before moving. Walking into a pearl
-     * that is still rising in the column is what triggers it on us - so the short pause is
-     * deliberate, not a rounding error.
+     * Watch the pearl dive before stepping away. A player waits for the pearl to reach the
+     * bottom of the shaft and get lifted about a block back up before turning around: by then it
+     * has clearly made it into the chamber, so the retreat cannot be mistaken for a re-throw and
+     * the pearl is left where the loader bot expects it.
      */
     private void handleAwaitThrowSettle() {
-        if (!awaitThrowSettleTimer.tick(THROW_FINISH_TICKS)) return;
+        // keep the look direction, but release every movement / click key while waiting
         submitInput(Input.builder().build(), lastAim[0], lastAim[1]);
-        info("Pearl confirmed in pit, entering RETREAT");
+        Entity pearl = restingPearlId != -1 ? CACHE.getEntityCache().get(restingPearlId) : null;
+        if (pearl != null) {
+            double y = pearl.getY();
+            if (!pearlSinkInit) {
+                pearlSinkInit = true;
+                pearlLowestY = y;
+            } else if (y < pearlLowestY) {
+                pearlLowestY = y;
+            } else if (y >= pearlLowestY + PEARL_RISE_ONE_BLOCK) {
+                info("Pearl reached the bottom (lowest y={}) and floated back up to y={} - hopping out along the {} side",
+                    String.format("%.2f", pearlLowestY), String.format("%.2f", y), trapdoorFacing());
+                setState(MoverState.RETREAT);
+                return;
+            }
+            if (stateTicks % 20 == 0) {
+                dbg("AWAIT_THROW_SETTLE: pearl y={} lowest={} risen={}",
+                    String.format("%.2f", y), String.format("%.2f", pearlLowestY),
+                    String.format("%.2f", y - pearlLowestY));
+            }
+        }
+        if (!awaitThrowSettleTimer.tick(THROW_SINK_TIMEOUT_TICKS)) return;
+        if (pearl == null) {
+            warn("Pearl entity vanished before it settled - hopping out anyway");
+        } else {
+            warn("Pearl did not sink and float back up within {} ticks (lowest={}, now={}) - hopping out anyway",
+                THROW_SINK_TIMEOUT_TICKS, String.format("%.2f", pearlLowestY),
+                String.format("%.2f", pearl.getY()));
+        }
         setState(MoverState.RETREAT);
     }
 
@@ -2370,9 +2508,9 @@ private boolean inPitFootprint() {
         retreatPrevHz = pc.getZ();
         float yaw;
         if (retreatNoProgressTicks > 40) {
-            // stuck in place: rotate direction every 40 ticks
+            // stuck in place: rotate through the escape directions, facing side first
             int dir = (retreatNoProgressTicks / 40) % 4;
-            yaw = (float) (dir * 90.0);
+            yaw = hopYaws()[dir];
             if (retreatNoProgressTicks % 40 == 1) {
                 info("RETREAT: no progress for {} ticks, trying yaw={}", retreatNoProgressTicks, yaw);
             }
@@ -2548,6 +2686,22 @@ private boolean inPitFootprint() {
         return (float) normalizeYaw(Math.toDegrees(Math.atan2(-f.x(), f.z())));
     }
 
+    /**
+     * Escape yaws in the order they are tried: the trapdoor's own facing side first, because
+     * that is the way a player leaves the pit - straight out over the lid. Only when that fails
+     * do the sideways directions follow, so a working exit is never missed just because an
+     * arbitrary absolute direction came first.
+     */
+    private float[] hopYaws() {
+        float base = stepAsideYaw();
+        float[] yaws = new float[HOP_SIDE_OFFSETS.length + 1];
+        yaws[0] = base;
+        for (int i = 0; i < HOP_SIDE_OFFSETS.length; i++) {
+            yaws[i + 1] = (float) normalizeYaw(base + HOP_SIDE_OFFSETS[i]);
+        }
+        return yaws;
+    }
+
     /** Yaw that points from the bot straight at the pit center (the sneak-creep direction). */
     private float pitFacingYaw() {
         var p = CACHE.getPlayerCache();
@@ -2650,6 +2804,14 @@ private boolean inPitFootprint() {
                 return;
             }
             setState(MoverState.MOVE_TO_THROW);
+            return;
+        }
+        if (whisperRepairPending) {
+            // this throw only existed to put a pearl back into the chamber we are about to
+            // leave, so skip the cargo flow and resume the whisper that was interrupted
+            whisperRepairPending = false;
+            info("Chamber restocked - resuming the pull whisper");
+            setState(MoverState.WHISPER);
             return;
         }
         setState(MoverState.RESTOCK_PEARLS);
@@ -3225,8 +3387,25 @@ private boolean inPitFootprint() {
         }
         if (atInput) config.outputBot = name;
         else config.inputBot = name;
+
+        // Do not ask for the pull with an empty chamber behind us: the loader bot on THIS side
+        // needs our pearl to pull us back here next round. If it is gone (consumed early, or the
+        // pearl never settled), walk back and throw one before whispering.
+        if (currentPit != null && whisperRepairAttempts < MAX_WHISPER_REPAIRS
+            && ownPearlsInPit() == 0 && !pearlRestingInPit()) {
+            whisperRepairAttempts++;
+            warn("No own pearl in the pit on this side - throwing one before whispering ({}/{})",
+                whisperRepairAttempts, MAX_WHISPER_REPAIRS);
+            BARITONE.stop();
+            whisperRepairPending = true;
+            setState(MoverState.MOVE_TO_THROW);
+            return;
+        }
+
         String cmd = "/w " + name + " tp";
         var p = CACHE.getPlayerCache();
+        whisperTarget = name;
+        loaderReplied = false;
         sendClientPacketAsync(new ServerboundChatPacket(cmd));
         info("Sent teleport command: {} (whispering the {} side's pearl bot to pull us there)", cmd, atInput ? "output" : "input");
         tpPrevX = p.getX();
@@ -3251,7 +3430,25 @@ private boolean inPitFootprint() {
             sideConfirmRequired = true;
             sideConfirmTicks = 0;
             settleTicks = config.teleportSettleTicks;
+            whisperTarget = "";
+            loaderReplied = false;
             setState(MoverState.START);
+            return;
+        }
+        // No answer at all after a while: the whisper probably never reached the loader (chat
+        // throttle, wrong name, loader busy), so ask again instead of sitting out the whole
+        // teleport timeout. Once it has answered we only wait for the pull.
+        if (!loaderReplied && !whisperTarget.isEmpty()
+            && stateTicks > config.whisperReplyTimeoutTicks) {
+            if (tpRetries++ < MAX_TP_RETRIES) {
+                warn("No reply from {} after {} ticks - whispering again ({}/{})",
+                    whisperTarget, config.whisperReplyTimeoutTicks, tpRetries, MAX_TP_RETRIES);
+                setState(MoverState.WHISPER);
+            } else {
+                error("No reply from {} after {} whispers - the pearl bot is not answering (check its name and that it is online)",
+                    whisperTarget, MAX_TP_RETRIES + 1);
+                setState(MoverState.ERROR);
+            }
             return;
         }
         if (!awaitTeleportTimer.tick(config.teleportTimeoutTicks)) {

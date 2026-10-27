@@ -25,6 +25,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - After climbing out of a chamber the bot now walks to the block just outside the pit on the
   trapdoor's facing side before sneaking in, instead of letting the pathfinder park it on
   whichever side happened to be nearest.
+- The throw is now placed near the middle of the column: the bot keeps leaning in for up to
+  `CREEP_CENTER_HOLD_TICKS` after the pit is already under its feet, so the pearl lands in the
+  centre of the chamber instead of against a wall.
+- After the throw the bot waits until the pearl has sunk to the bottom of the shaft and been
+  lifted about a block back up before it hops out, instead of leaving after a fixed two ticks.
+- Leaving the shaft now tries the trapdoor's facing side first and only falls back to the
+  sideways directions when the bot cannot get clear that way.
+- The pull whisper is repeated when the loader bot never answers, up to `MAX_TP_RETRIES` times,
+  controlled by the new `whisperReplyTimeoutTicks` setting.
+- Before whispering, the bot re-checks that this side's chamber still holds one of its own pearls
+  and throws one back in if it does not, so the chamber is stocked for the next round.
 
 ### Fixed
 
