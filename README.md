@@ -18,7 +18,8 @@ standing next to the chamber can then touch that pearl and get teleported to it.
 
 StashMover uses this in both directions:
 
-1. Walk to the chamber, open its trapdoor, sneak to the centre and throw a pearl straight down.
+1. Walk to the chamber and stand on the block just outside the pit on the trapdoor's facing
+   side, open the trapdoor, sneak to the centre and throw a pearl straight down.
 2. Retreat along the trapdoor's facing side until the pearl has stopped sinking and the bot is
    clear of the shaft.
 3. Do the cargo work at that side.

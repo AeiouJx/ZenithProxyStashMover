@@ -111,6 +111,12 @@ private static final int PIT_SHAFT_DEPTH = 8;
     private static final float[] HOP_YAWS = {0f, 90f, 180f, -90f};
     /** Ticks of hand-driven hopping used to shake baritone loose when pathing stalls */
     private static final int SHAKE_OFF_TICKS = 12;
+    /** Close enough to the stand cell next to the pit that the sneak-in can start (0.6 blocks) */
+    private static final double STAND_ARRIVED_SQ = 0.36;
+    /** Beyond this the walk to the stand cell is handed to baritone (2.5 blocks) */
+    private static final double STAND_BARITONE_SQ = 6.25;
+    /** Ticks of hand-walking toward the stand cell before it counts as a failed approach */
+    private static final int STAND_HAND_TIMEOUT_TICKS = 100;
     private static final int MAX_TRAPDOOR_RETRIES = 3;
     /** Ticks to wait for a clicked trapdoor to read as open before clicking it again */
     private static final int AWAIT_TRAPDOOR_TICKS = 10;
@@ -185,6 +191,8 @@ private static final int PIT_SHAFT_DEPTH = 8;
     private int moveToThrowRetries = 0;
     /** Last MOVE_TO_THROW arrival verdict, only used to log transitions */
     private boolean lastNearThrow = false;
+    /** Set when the facing-side stand cell could not be reached, so baritone parks us instead */
+    private boolean standApproachFailed = false;
     /** Sneak-creep progress tracking (walking to the throw spot over the pit edge) */
     private int creepStuckTicks = 0;
     private double creepLastHx = 0.0;
@@ -334,6 +342,7 @@ private static final int PIT_SHAFT_DEPTH = 8;
         settleTicks = 0;
         errorHandled = false;
         lastNearThrow = false;
+        standApproachFailed = false;
         creepStuckTicks = 0;
         creepInit = false;
         riseStuckTicks = 0;
@@ -625,6 +634,7 @@ private static final int PIT_SHAFT_DEPTH = 8;
         retreatStableTicks = 0;
         hasRetreatPrev = false;
         pearlIdsBeforeThrow.clear();
+        standApproachFailed = false;
         setState(MoverState.EVAL_SIDE);
     }
 
@@ -754,6 +764,8 @@ private double nearestSideDistSq() {
             }
         }
         dbg("DETERMINE_PIT done: pit={} trapdoor={}", fmt(currentPit), fmt(trapdoorPos));
+        // the stand cell is derived from the pit and its trapdoor, so a new pit gets a new try
+        standApproachFailed = false;
 
         // A pull always drops us into a chamber, and a side usually has two of them: the
         // configured pit plus the one whose pearl the loader bot just consumed. Identify the
@@ -1047,6 +1059,52 @@ private int[] arrivalChamber() {
                 db == null ? "none" : db.name(), trapdoorFacing(), botInPitColumn());
         }
 
+        // Before sneaking in, walk to the cell a player would start from: the block next to the
+        // pit on the trapdoor's facing side, at rim level. Hopping out of the shaft can leave us
+        // anywhere around it, and letting baritone pick "the nearest cell to the pit" is what
+        // used to leave the bot on the far side, where the sneak-in has to cross the rim.
+        int[] stand = aboveWater ? facingStandBlock() : null;
+        if (!near && stand != null && !standApproachFailed) {
+            double sdx = (stand[0] + 0.5) - p.getX();
+            double sdz = (stand[2] + 0.5) - p.getZ();
+            double sd2 = sdx * sdx + sdz * sdz;
+            if (sd2 > STAND_ARRIVED_SQ) {
+                if (stateTicks % 40 == 1 || sd2 > STAND_BARITONE_SQ) {
+                    dbg("Heading for the stand cell {} on the {} side of the pit (dist={})",
+                        fmt(stand), trapdoorFacing(), String.format("%.2f", Math.sqrt(sd2)));
+                }
+                if (sd2 > STAND_BARITONE_SQ) {
+                    // more than a couple of blocks: let baritone route around the shaft
+                    if (shakeOffTicks > 0) {
+                        shakeOffTicks--;
+                        submitInput(Input.builder().pressingForward(true).jumping(true).build(),
+                            yawTo(sdx, sdz), 0f);
+                        return;
+                    }
+                    if (!BARITONE.getCustomGoalProcess().isActive()) {
+                        BARITONE.pathTo(new GoalBlock(stand[0], stand[1], stand[2]));
+                    }
+                    if (++pathTicks > config.pathTimeoutTicks) {
+                        pathTicks = 0;
+                        onStandApproachTimeout(stand);
+                    }
+                    return;
+                }
+                // close: walk the last block or two by hand, no baritone. The rim sits one block
+                // above the surrounding ground, so hop while the feet are still below it.
+                BARITONE.stop();
+                boolean stepUp = stand[1] > (int) Math.floor(p.getY() + 0.01);
+                submitInput(Input.builder().pressingForward(true).jumping(stepUp).build(),
+                    yawTo(sdx, sdz), 0f);
+                if (++pathTicks > STAND_HAND_TIMEOUT_TICKS) {
+                    pathTicks = 0;
+                    onStandApproachTimeout(stand);
+                }
+                return;
+            }
+            pathTicks = 0;
+        }
+
         // close range: baritone already parked us on a standable cell beside the pit,
         // so from here on everything is hand-driven input
         if (horizSq < 9.0 && aboveWater) {
@@ -1069,6 +1127,7 @@ private int[] arrivalChamber() {
                 setState(MoverState.OPEN_TRAPDOOR);
                 return;
             }
+
             // arrived: straight-down look sees the pit water -> throw
             if (near) {
                 // Arrived at the throw position. Deliberately the one place that counts ANY
@@ -1357,6 +1416,58 @@ private int[] arrivalChamber() {
     private int[] throwStand() {
         if (trapdoorPos != null) return new int[]{trapdoorPos[0], trapdoorPos[1] + 1, trapdoorPos[2]};
         return new int[]{currentPit[0], currentPit[1] + 1, currentPit[2]};
+    }
+
+    /**
+     * Cell a player would walk to before stepping in: the rim block next to the pit on the
+     * trapdoor's facing side, one block out from the centre hole along that axis. Baritone
+     * otherwise parks us on whatever standable cell is nearest, which can be on the opposite
+     * side of the shaft, where the sneak-in has to cross the rim first.
+     *
+     * @return feet position {x, y, z}, or null when no cell on that side is standable
+     */
+    private int[] facingStandBlock() {
+        Direction f = trapdoorFacing();
+        if (f == null) return null;
+        int rimY = (trapdoorPos != null ? trapdoorPos[1] : currentPit[1]) + 1;
+        // r=1 is the rim block itself; r=2 is the fallback one further out (rim taken by the
+        // restock chest, a wall, or a sign post)
+        for (int r = 1; r <= 2; r++) {
+            int x = currentPit[0] + f.x() * r;
+            int z = currentPit[2] + f.z() * r;
+            // the rim can sit one lower on uneven ground, so try the level below as well
+            for (int dy = 0; dy >= -1; dy--) {
+                int y = rimY + dy;
+                if (standableAt(x, y, z)) return new int[]{x, y, z};
+            }
+        }
+        return null;
+    }
+
+    /** Count a failed walk to the stand cell; after three tries baritone parks us instead. */
+    private void onStandApproachTimeout(int[] stand) {
+        if (++moveToThrowRetries > 2) {
+            standApproachFailed = true;
+            moveToThrowRetries = 0;
+            warn("Could not reach the stand cell {} next to the pit - letting baritone park us wherever it can",
+                fmt(stand));
+            logBotNeighborhood();
+            return;
+        }
+        warn("Path to the stand cell {} timed out, retrying ({}/3)", fmt(stand), moveToThrowRetries);
+        shakeOffTicks = SHAKE_OFF_TICKS;
+    }
+
+    /** Solid floor underneath, clear of collision and liquid for the two body blocks. */
+    private boolean standableAt(int x, int y, int z) {
+        if (!World.isChunkLoadedBlockPos(x, z)) return false;
+        var below = WORLD_BLOCK(x + 0.5, y - 1, z + 0.5);
+        if (below == null || !isSolidBlock(below)) return false;
+        var feet = WORLD_BLOCK(x + 0.5, y, z + 0.5);
+        var head = WORLD_BLOCK(x + 0.5, y + 1, z + 0.5);
+        if (feet == null || head == null) return false;
+        return !isSolidBlock(feet) && !isSolidBlock(head)
+            && !isLiquidBlock(feet) && !isLiquidBlock(head);
     }
 
     /**
@@ -2442,6 +2553,12 @@ private boolean inPitFootprint() {
         var p = CACHE.getPlayerCache();
         double dx = (currentPit[0] + 0.5) - p.getX();
         double dz = (currentPit[2] + 0.5) - p.getZ();
+        if (dx * dx + dz * dz < 0.0004) return lastAim[0];
+        return (float) normalizeYaw(Math.toDegrees(Math.atan2(-dx, dz)));
+    }
+
+    /** Yaw that makes the bot face the given horizontal offset. */
+    private float yawTo(double dx, double dz) {
         if (dx * dx + dz * dz < 0.0004) return lastAim[0];
         return (float) normalizeYaw(Math.toDegrees(Math.atan2(-dx, dz)));
     }

@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   512-block position fallback moved to the new `EVAL_SIDE` state.
 - Chamber detection on arrival reads the bubble column the bot is standing in, instead of
   guessing from the distance to the configured pit.
+- After climbing out of a chamber the bot now walks to the block just outside the pit on the
+  trapdoor's facing side before sneaking in, instead of letting the pathfinder park it on
+  whichever side happened to be nearest.
 
 ### Fixed
 
