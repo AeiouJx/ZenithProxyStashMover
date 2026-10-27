@@ -41,6 +41,8 @@ import com.zenith.mc.block.Direction;
 import com.zenith.mc.block.properties.api.BlockStateProperties;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.module.api.Module;
+import com.zenith.util.timer.Timer;
+import com.zenith.util.timer.Timers;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.object.ProjectileData;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
@@ -63,9 +65,11 @@ import static com.zenith.Globals.*;
 /**
  * StashMover core module.
  *
- * <p>START -> DETERMINE_PIT -> MOVE_TO_THROW -> (EXIT_WATER -> OPEN_TRAPDOOR) -> THROWING
- * -> RETREAT -> RESTOCK_PEARLS -> MOVE_TO_CHEST -> CARGO -> [MOVE_TO_ECHEST -> ECHEST]* ->
- * CLOSING -> WHISPER -> WAIT_TELEPORT -> START
+ * <p>START -> EVAL_SIDE -> DETERMINE_PIT -> MOVE_TO_THROW ->
+ * (EXIT_WATER -> OPEN_TRAPDOOR -> AWAIT_TRAPDOOR_OPEN)* -> THROWING -> THROW_PEARL ->
+ * AWAIT_PEARL_SPAWNED -> AWAIT_THROW_SETTLE -> RETREAT -> AWAIT_PEARL_STABLE ->
+ * RESTOCK_PEARLS -> MOVE_TO_CHEST -> CARGO -> [MOVE_TO_ECHEST -> ECHEST]* -> CLOSING ->
+ * WHISPER -> AWAIT_TELEPORT -> START
  *
  * <p>Teleporting is dimension-agnostic: success is detected purely by a coordinate jump, and
  * the side is re-confirmed from positive evidence before any cargo work after a pull.
@@ -108,6 +112,8 @@ private static final int PIT_SHAFT_DEPTH = 8;
     /** Ticks of hand-driven hopping used to shake baritone loose when pathing stalls */
     private static final int SHAKE_OFF_TICKS = 12;
     private static final int MAX_TRAPDOOR_RETRIES = 3;
+    /** Ticks to wait for a clicked trapdoor to read as open before clicking it again */
+    private static final int AWAIT_TRAPDOOR_TICKS = 10;
     private static final double PIT_NEAR_DIST_SQ = 4.0;
     /** How far off the pit centre a pearl may sit horizontally and still count as "in the pit". */
     private static final double PIT_PEARL_COL_DX = 0.6;
@@ -141,6 +147,17 @@ private static final int PIT_SHAFT_DEPTH = 8;
 
     private int stateTicks = 0;
     private int pathTicks = 0;
+    /**
+     * One timer per awaited step. {@link #setState} resets all of them, so a timeout always
+     * measures how long the current step has been waiting - not how long some counter that is
+     * shared with three other branches happens to have been running.
+     */
+    private final Timer awaitTrapdoorTimer = Timers.tickTimer();
+    private final Timer awaitPearlSpawnTimer = Timers.tickTimer();
+    private final Timer awaitThrowSettleTimer = Timers.tickTimer();
+    private final Timer awaitPearlStableTimer = Timers.tickTimer();
+    private final Timer awaitRetreatTimer = Timers.tickTimer();
+    private final Timer awaitTeleportTimer = Timers.tickTimer();
     private int openAttemptCooldown = 0;
     private int tpRetries = 0;
     private int throwRetries = 0;
@@ -185,10 +202,6 @@ private static final int PIT_SHAFT_DEPTH = 8;
     private int[] landingPos = null;
     private int[] echestPos = null;
     private int[] trapdoorPos = null;
-
-    // throw substeps
-    private int throwStep = 0;
-    private int throwTicks = 0;
     private float[] lastAim = new float[]{0f, 0f};
     private Set<Integer> pearlIdsBeforeThrow = new HashSet<>();
 
@@ -307,8 +320,6 @@ private static final int PIT_SHAFT_DEPTH = 8;
         landingPos = null;
         echestPos = null;
         trapdoorPos = null;
-        throwStep = 0;
-        throwTicks = 0;
         restingPearlId = -1;
         pearlStayTicks = 0;
         pearlMissingTicks = 0;
@@ -346,7 +357,7 @@ private static final int PIT_SHAFT_DEPTH = 8;
             }
         }
         reset();
-        info("Config changed 闁?module state reset");
+        info("Config changed - module state reset");
     }
 
     public String getStatus() {
@@ -362,7 +373,7 @@ private static final int PIT_SHAFT_DEPTH = 8;
             + "\nlanding=" + fmt(landingPos)
             + "\nechest=" + fmt(echestPos)
             + "\npearls=" + pearlCount()
-            + "\nthrowStep=" + throwStep + " throwRetries=" + throwRetries
+            + "\nthrowRetries=" + throwRetries
             + "\nrestingPearlId=" + restingPearlId + " pearlStayTicks=" + pearlStayTicks
             + "\nsideConfirmRequired=" + sideConfirmRequired
             + "\nsettleTicks=" + settleTicks;
@@ -373,6 +384,12 @@ private static final int PIT_SHAFT_DEPTH = 8;
         stateTicks = 0;
         pathTicks = 0;
         openAttemptCooldown = 0;
+        awaitTrapdoorTimer.reset();
+        awaitPearlSpawnTimer.reset();
+        awaitThrowSettleTimer.reset();
+        awaitPearlStableTimer.reset();
+        awaitRetreatTimer.reset();
+        awaitTeleportTimer.reset();
         retreatNoProgressTicks = 0;
         trapdoorStepOffTicks = 0;
         trapdoorApproachInit = false;
@@ -443,9 +460,10 @@ private static final int PIT_SHAFT_DEPTH = 8;
         if (hasLastPos) {
             double d2 = distSq(px, py, pz, lastX, lastY, lastZ);
             boolean expecting = state == MoverState.WHISPER
-                || state == MoverState.WAIT_TELEPORT
+                || state == MoverState.AWAIT_TELEPORT
                 || state == MoverState.IDLE
                 || state == MoverState.START
+                || state == MoverState.EVAL_SIDE
                 || state == MoverState.ERROR;
             if (!expecting && d2 > (double) config.tpDetectDistance * config.tpDetectDistance) {
                 landingPos = new int[]{(int) Math.floor(px), (int) Math.floor(py), (int) Math.floor(pz)};
@@ -479,7 +497,10 @@ private static final int PIT_SHAFT_DEPTH = 8;
         // bubble column - it keeps recomputing MovementAscend / "No path found" and, failing
         // that, will happily mine the very trapdoor we need to get out.
         if (state != MoverState.MOVE_TO_THROW && state != MoverState.OPEN_TRAPDOOR
-            && state != MoverState.THROWING && state != MoverState.RETREAT
+            && state != MoverState.AWAIT_TRAPDOOR_OPEN
+            && state != MoverState.THROWING && state != MoverState.THROW_PEARL
+            && state != MoverState.AWAIT_PEARL_SPAWNED && state != MoverState.AWAIT_THROW_SETTLE
+            && state != MoverState.RETREAT && state != MoverState.AWAIT_PEARL_STABLE
             && state != MoverState.ERROR && state != MoverState.IDLE
             && escapeFromPitShaft()) {
             return;
@@ -488,12 +509,18 @@ private static final int PIT_SHAFT_DEPTH = 8;
             switch (state) {
                 case IDLE -> setState(MoverState.START);
                 case START -> handleStart();
+                case EVAL_SIDE -> handleEvalSide();
                 case DETERMINE_PIT -> handleDeterminePit();
                 case MOVE_TO_THROW -> handleMoveToThrow();
                 case EXIT_WATER -> handleExitWater();
                 case OPEN_TRAPDOOR -> handleOpenTrapdoor();
+                case AWAIT_TRAPDOOR_OPEN -> handleAwaitTrapdoorOpen();
                 case THROWING -> handleThrowing();
+                case THROW_PEARL -> handleThrowPearl();
+                case AWAIT_PEARL_SPAWNED -> handleAwaitPearlSpawned();
+                case AWAIT_THROW_SETTLE -> handleAwaitThrowSettle();
                 case RETREAT -> handleRetreat();
+                case AWAIT_PEARL_STABLE -> handleAwaitPearlStable();
                 case RESTOCK_PEARLS -> handleRestockPearls();
                 case MOVE_TO_CHEST -> handleMoveToContainer(activeChest(), MoverState.CARGO);
                 case CARGO -> handleCargo();
@@ -501,7 +528,7 @@ private static final int PIT_SHAFT_DEPTH = 8;
                 case ECHEST -> handleEchest();
                 case CLOSING -> handleClosing();
                 case WHISPER -> handleWhisper();
-                case WAIT_TELEPORT -> handleWaitTeleport();
+                case AWAIT_TELEPORT -> handleAwaitTeleport();
                 case ERROR -> handleError();
             }
         } catch (Throwable e) {
@@ -579,13 +606,37 @@ private static final int PIT_SHAFT_DEPTH = 8;
         }
     }
 
+    /**
+ * Entry point: clear the per-visit variables and move on. All deciding happens in EVAL_SIDE.
+ */
     private void handleStart() {
-        // A coordinate jump drops us wherever we were standing when the pull happened - and a
-        // fresh login lands on the queue server's world spawn, roughly eleven million blocks
-        // from both stashes. Baritone cannot path that far, so all it does is recompute and
-        // fail for as long as we let it. Neither side is reachable from there, so just idle:
-        // once the queue drops us onto the main server we are next to a stash again and this
-        // lets go on its own.
+        tpRetries = 0;
+        throwRetries = 0;
+        trapdoorRetries = 0;
+        firstCargoCheck = true;
+        restockSubmitted = false;
+        currentPit = null;
+        pitSurfaceY = -1;
+        echestPos = null;
+        trapdoorPos = null;
+        restingPearlId = -1;
+        pearlStayTicks = 0;
+        pearlMissingTicks = 0;
+        retreatStableTicks = 0;
+        hasRetreatPrev = false;
+        pearlIdsBeforeThrow.clear();
+        setState(MoverState.EVAL_SIDE);
+    }
+
+    /**
+     * Decide which side we are on, or stand still until we can.
+     *
+     * <p>A coordinate jump drops us wherever we were standing when the pull happened - and a
+     * fresh login lands on the queue server's world spawn, roughly eleven million blocks from
+     * both stashes. Baritone cannot path that far, so all it does is recompute and fail for as
+     * long as we let it, and neither side is reachable from there anyway.
+     */
+    private void handleEvalSide() {
         double nearest = nearestSideDistSq();
         if (nearest > MAX_SIDE_DIST_SQ) {
             if (!waitingForSideLogged) {
@@ -617,23 +668,6 @@ private static final int PIT_SHAFT_DEPTH = 8;
             // Keep the side established by the last teleport when nothing is conclusive
             dbg("Could not determine side by chests/markers, keeping {} side", isInput() ? "INPUT" : "OUTPUT");
         }
-        tpRetries = 0;
-        throwRetries = 0;
-        trapdoorRetries = 0;
-        firstCargoCheck = true;
-        restockSubmitted = false;
-        currentPit = null;
-        pitSurfaceY = -1;
-        echestPos = null;
-        trapdoorPos = null;
-        throwStep = 0;
-        throwTicks = 0;
-        restingPearlId = -1;
-        pearlStayTicks = 0;
-        pearlMissingTicks = 0;
-        retreatStableTicks = 0;
-        hasRetreatPrev = false;
-        pearlIdsBeforeThrow.clear();
         info("Start visit at {}", isInput() ? "INPUT" : "OUTPUT");
         setState(MoverState.DETERMINE_PIT);
     }
@@ -705,16 +739,15 @@ private double nearestSideDistSq() {
                     currentPit = trapdoorPos;
                 }
             }
-            if (pearlRestingInPit()) {
-                info("Pearl already risen and resting in the pit, skipping the throw");
+            int own = ownPearlsInPit();
+            if (own > 0 || pearlRestingInPit()) {
+                info("{} own pearl(s) already in the pit, skipping the throw", own);
                 restingPearlId = lastFoundPearlId != -1 ? lastFoundPearlId : ownRisenPearlIdAtPit();
                 pearlStayTicks = 0;
                 pearlMissingTicks = 0;
                 retreatStableTicks = 0;
                 retreatLeaveWarned = false;
                 hasRetreatPrev = false;
-                throwStep = 0;
-                throwTicks = 0;
                 pearlIdsBeforeThrow.clear();
                 setState(MoverState.RETREAT);
                 return;
@@ -722,37 +755,34 @@ private double nearestSideDistSq() {
         }
         dbg("DETERMINE_PIT done: pit={} trapdoor={}", fmt(currentPit), fmt(trapdoorPos));
 
-        // If the pull landed us in a NEIGHBOURING chamber instead of the configured pit, the
-        // pearl on this side never made it into the chamber. Stock the chamber we are
-        // actually standing in with a throw of its own, then walk over to the real pit -
-        // that way the pearl bot always finds a loaded chamber to pull us with.
-        double pitDistSq = distSqFromBot(currentPit);
-        if (pitDistSq > 64.0) {
-            int[] other = nearbyOtherPit();
-            warn("Landed {} blocks from the configured pit {}", (long) Math.sqrt(pitDistSq), fmt(currentPit));
-            if (other != null) {
-                info("Pulled into a neighbouring chamber {} - stocking it with a pearl first, "
-                    + "then heading to the configured pit {}", fmt(other), fmt(currentPit));
+        // A pull always drops us into a chamber, and a side usually has two of them: the
+        // configured pit plus the one whose pearl the loader bot just consumed. Identify the
+        // column we are actually standing in, climb out of it, and stock it with a throw of
+        // its own before walking over to the configured pit - otherwise that chamber stays
+        // empty and the loader has nothing to pull us with next time.
+        int[] arrival = arrivalChamber();
+        if (arrival != null && !sameColumn(arrival, currentPit)) {
+            int stocked = ownPearlsInChamber(arrival);
+            if (stocked > 0) {
+                info("Pulled into the neighbouring chamber {} which already holds {} of our pearls - "
+                    + "walking over to the configured pit {}", fmt(arrival), stocked, fmt(currentPit));
+            } else {
+                info("Pulled into the neighbouring chamber {} - stocking it with a pearl first, "
+                    + "then heading to the configured pit {}", fmt(arrival), fmt(currentPit));
                 detourPit = currentPit;
                 detourTrapdoor = trapdoorPos;
-                currentPit = other;
-                trapdoorPos = other;
+                currentPit = arrival;
+                int[] lid = trapdoorOverColumn(arrival[0], arrival[2], arrival[1]);
+                trapdoorPos = lid != null ? lid : findNearestTrapdoor(arrival, 3);
                 detourPending = true;
                 pitSurfaceY = -1;
                 echestPos = null;
-                throwStep = 0;
-                throwTicks = 0;
                 restingPearlId = -1;
                 retreatStableTicks = 0;
                 pearlRiseInit = false;
                 belowPitTicks = 0;
                 moveToThrowRetries = 0;
                 pearlIdsBeforeThrow.clear();
-            } else {
-                warn("Landed {} blocks from the configured pit {} but found no neighbouring chamber under us "
-                        + "to restock - walking straight over",
-                    (long) Math.sqrt(pitDistSq), fmt(currentPit));
-                logBotNeighborhood();
             }
         }
 
@@ -790,19 +820,39 @@ private int[] shutChamberTrapdoor() {
     }
 
 /**
- * A pearl chamber we have landed in that is NOT the configured pit - i.e. the neighbouring
- * chamber the pull dropped us into, which now needs a pearl of its own. Scans the whole 3x3
- * chamber footprint around the bot (nearest cell first) rather than only the bot's own column:
- * landing on the rim a block to the side of the shaft is just as much "we are in the wrong
- * chamber" and must still be restocked.
+ * The chamber the bot is standing in right now, expressed as the position to use as its pit:
+ * the trapdoor at the top of its bubble column (or the column block itself when there is no
+ * lid), and null when the bot is not standing in a chamber at all.
+ *
+ * <p>Two arrival shapes have to be recognised, and a pull produces one of them: inside the
+ * bubble column (the pearl chamber proper) or on top of the closed lid above it. Walking
+ * around on the surface is not an arrival, which is why this looks at the bot's own column
+ * instead of scanning a radius around the configured pit.
  */
-private int[] nearbyOtherPit() {
-        if (currentPit == null) return null;
+private int[] arrivalChamber() {
         var p = CACHE.getPlayerCache();
-        int feet = (int) Math.floor(p.getY());
         int bx = (int) Math.floor(p.getX());
         int bz = (int) Math.floor(p.getZ());
-        // centre first, then the four orthogonal cells, then the diagonals
+        int feet = (int) Math.floor(p.getY());
+        // 1. the column of the chamber we are in: our own cell first, then the rest of the
+        //    3x3 footprint, because a pull can drop us on the rim next to the shaft
+        int[] col = bubbleColumnNear(bx, feet, bz);
+        if (col != null) {
+            int[] lid = trapdoorOverColumn(col[0], col[2], col[1]);
+            return lid != null ? lid : col;
+        }
+        // 2. standing on (or wedged in) the closed lid above the column
+        int[] lid = trapdoorOverColumn(bx, bz, feet);
+        if (lid != null && Math.abs(lid[1] - feet) <= 2) return lid;
+        return null;
+}
+
+    /**
+     * The nearest bubble column inside the 3x3 footprint around the given cell, or null. This
+     * is what identifies a pearl chamber: the column is the part that holds the pearl, so the
+     * chamber's X/Z come from it rather than from wherever the bot happened to land.
+     */
+    private int[] bubbleColumnNear(int bx, int feet, int bz) {
         int[][] offsets = {{0, 0}, {0, 1}, {0, -1}, {1, 0}, {-1, 0},
             {1, 1}, {-1, -1}, {1, -1}, {-1, 1}};
         for (int[] off : offsets) {
@@ -810,13 +860,34 @@ private int[] nearbyOtherPit() {
             int z = bz + off[1];
             for (int y = feet + 1; y >= feet - 2; y--) {
                 var b = WORLD_BLOCK(x + 0.5, y, z + 0.5);
-                if (b == null || !b.name().endsWith("_trapdoor")) continue;
-                // that is the chamber we are actually configured to use
-                if (x == currentPit[0] && z == currentPit[2] && y == currentPit[1]) continue;
-                return new int[]{x, y, z};
+                if (b == null) break;
+                String n = b.name();
+                if (n.contains("bubble_column")) return new int[]{x, y, z};
+                if (n.endsWith("_trapdoor") || isSolidBlock(b)) break;
             }
         }
         return null;
+    }
+
+    /**
+     * The trapdoor inside one column closest to the given Y. A chamber can carry two lids
+     * (one at the pit level, one above it) and either of them can be the one we need, so
+     * "nearest" is the right pick - always taking the top one would make a deep landing look
+     * like it is above the rim.
+     */
+    private int[] trapdoorOverColumn(int x, int z, int nearY) {
+        int[] best = null;
+        for (int y = nearY + PIT_SHAFT_DEPTH + 2; y >= nearY - 3; y--) {
+            var b = WORLD_BLOCK(x + 0.5, y, z + 0.5);
+            if (b == null || !b.name().endsWith("_trapdoor")) continue;
+            if (best == null || Math.abs(y - nearY) < Math.abs(best[1] - nearY)) best = new int[]{x, y, z};
+        }
+        return best;
+    }
+
+    /** True when both positions sit in the same pit column (same block X/Z). */
+    private static boolean sameColumn(int[] a, int[] b) {
+        return a != null && b != null && a[0] == b[0] && a[2] == b[2];
     }
 
     /**
@@ -1000,12 +1071,19 @@ private int[] nearbyOtherPit() {
             }
             // arrived: straight-down look sees the pit water -> throw
             if (near) {
-                // The chamber being occupied is enough - ours or anybody's. Another pearl on
-                // top of it neither helps the loader pull us nor does us any good, and a run
-                // whose return trip keeps failing would otherwise pile one in every round.
+                // Arrived at the throw position. Deliberately the one place that counts ANY
+                // pearl rather than only our own: this is the physical question "is there
+                // already something down there?", and throwing a second one on top of a pearl
+                // somebody else parked is how one run once left nine of them stacked in the
+                // chamber.
                 int inPit = pearlsInPit();
                 if (inPit > 0) {
-                    info("Chamber already holds {} pearl(s) - not throwing another one", inPit);
+                    int ownHere = ownPearlsInPit();
+                    info("Chamber already holds {} pearl(s) ({} of them ours) - not throwing another one",
+                        inPit, ownHere);
+                    if (ownHere == 0) {
+                        warn("The pearl in the chamber is not ours - the loader may not be able to use it");
+                    }
                     restingPearlId = lastFoundPearlId != -1 ? lastFoundPearlId : ownRisenPearlIdAtPit();
                     retreatStableTicks = 0;
                     pearlRiseInit = false;
@@ -1412,6 +1490,8 @@ private int[] nearbyOtherPit() {
             return;
         }
         if (trapdoorPos != null && !isTrapdoorOpen()) {
+            // go back through EXIT_WATER once it is open: there may be a second lid
+            overrideTrapdoor = trapdoorPos;
             setState(MoverState.OPEN_TRAPDOOR);
             return;
         }
@@ -1423,14 +1503,15 @@ private int[] nearbyOtherPit() {
             submitInput(Input.builder().build(), pitFacingYaw(), 0f);
             pitEscapeTicks = 0;
             // Only now, with the bot standing outside the chamber, decide whether a throw is
-            // needed at all: a pearl of ours already resting in the pit means this round is
+            // needed at all: one of our own pearls already in the pit means this round is
             // stocked, so go straight to the cargo work. If there is none, walk back in and
-            // throw. Hopping off the trapdoor can fling us a dozen blocks away, and the distance
-            // does not change the decision.
-            if (throwStep == 0 && !detourPending && pearlRestingInPit()) {
-                info("Out of the pit, pearl already resting in it at {} ({} blocks away) - "
+            // throw. Somebody else's pearl does not count - it is not ours for the loader to
+            // use - and how far we hopped off the trapdoor does not change the decision.
+            int own = ownPearlsInPit();
+            if (!detourPending && (own > 0 || pearlRestingInPit())) {
+                info("Out of the pit, {} own pearl(s) already in it at {} ({} blocks away) - "
                         + "skipping the throw and going straight to {}",
-                    fmt(currentPit), (long) Math.sqrt(distSqFromBot(currentPit)),
+                    own, fmt(currentPit), (long) Math.sqrt(distSqFromBot(currentPit)),
                     isInput() ? "cargo" : "unload");
                 restingPearlId = lastFoundPearlId != -1 ? lastFoundPearlId : ownRisenPearlIdAtPit();
                 retreatStableTicks = 0;
@@ -1687,17 +1768,6 @@ private boolean inPitFootprint() {
             }
         }
         trapdoorStepOffTicks = 0;
-        if (rightClickHeld) {
-            // release the click after one tick so the server processes a single useItemOn
-            rightClickHeld = false;
-            submitInput(Input.builder().build(), lastAim[0], lastAim[1]);
-            openAttemptCooldown = 8;
-            return;
-        }
-        if (openAttemptCooldown > 0) {
-            openAttemptCooldown--;
-            return;
-        }
         // Always aim straight AT the trapdoor and click that exact block, whether we are
         // beside it or standing on it - anything else can end up aimed at the floor.
         var aim = aimAt(target);
@@ -1709,11 +1779,47 @@ private boolean inPitFootprint() {
             .clickRequiresRotation(false)
             .build(), aim[0], aim[1]);
         rightClickHeld = true;
-        if (++trapdoorRetries > MAX_TRAPDOOR_RETRIES) {
-            error("Failed to open the trapdoor after retries");
-            setState(MoverState.ERROR);
-        } else {
-            stateTicks = 0;
+        awaitTrapdoorTimer.reset();
+        setState(MoverState.AWAIT_TRAPDOOR_OPEN);
+    }
+
+    /**
+     * Wait for the lid that was just clicked to read as open. A rejected click - own hitbox in
+     * the way, out of reach, a lag spike - is indistinguishable from "nothing happened", so a
+     * timeout simply repeats the whole open step (which redoes the hop-out dance when that is
+     * what the position needs).
+     */
+    private void handleAwaitTrapdoorOpen() {
+        // release the click a tick after it was sent, so the server processes one useItemOn
+        if (rightClickHeld) {
+            rightClickHeld = false;
+            submitInput(Input.builder().build(), lastAim[0], lastAim[1]);
+            return;
+        }
+        int[] target = openTarget();
+        if (target == null) {
+            setState(MoverState.THROWING);
+            return;
+        }
+        if (isTrapdoorOpenAt(target)) {
+            info("Opened the chamber lid at {}", fmt(target));
+            if (overrideTrapdoor != null) {
+                // a lid found while climbing out: back to EXIT_WATER, which looks for a
+                // second lid before the bot tries to hop out
+                overrideTrapdoor = null;
+                setState(MoverState.EXIT_WATER);
+            } else {
+                setState(MoverState.THROWING);
+            }
+            return;
+        }
+        if (awaitTrapdoorTimer.tick(AWAIT_TRAPDOOR_TICKS)) {
+            if (++trapdoorRetries > MAX_TRAPDOOR_RETRIES) {
+                error("Failed to open the trapdoor at {} after {} attempts", fmt(target), MAX_TRAPDOOR_RETRIES);
+                setState(MoverState.ERROR);
+            } else {
+                setState(MoverState.OPEN_TRAPDOOR);
+            }
         }
     }
 
@@ -1796,143 +1902,147 @@ private boolean inPitFootprint() {
 
     // ==================== throwing ====================
 
+    /**
+     * Prepare the throw: a pearl in the held slot, the lid open, the drop path clear. Nothing
+     * is thrown from here - {@link #handleThrowPearl()} does the single click, so a retry does
+     * not repeat these checks and a rejected click is retried on its own.
+     */
     private void handleThrowing() {
-        switch (throwStep) {
-            case 0 -> {
-                if (!pearlInHeld()) {
-                    if (!hasAnyPearl()) {
-                        warn("No ender pearl available, restocking first");
-                        if (pearlChestUnreachable()) {
-                            error("No pearl and the pearl restock chest is unreachable");
-                            setState(MoverState.ERROR);
-                        } else {
-                            restockSubmitted = false;
-                            // we are mid-throw: once restocked we must go BACK to the pit,
-                            // not on to the cargo flow, or the throw is silently skipped
-                            afterRestock = MoverState.MOVE_TO_THROW;
-                            setState(MoverState.RESTOCK_PEARLS);
-                        }
-                        return;
-                    }
-                    if (!INVENTORY.hasActiveRequest()) {
-                        submitMovePearlToHotbar();
-                    }
-                    if (stateTicks % 20 == 0) {
-                        info("THROWING waiting: pearl not in the held slot (anyPearl={} requestActive={} waited={} ticks)",
-                            hasAnyPearl(), INVENTORY.hasActiveRequest(), stateTicks);
-                    }
-                    return;
+        if (!pearlInHeld()) {
+            if (!hasAnyPearl()) {
+                warn("No ender pearl available, restocking first");
+                if (pearlChestUnreachable()) {
+                    error("No pearl and the pearl restock chest is unreachable");
+                    setState(MoverState.ERROR);
+                } else {
+                    restockSubmitted = false;
+                    // we are mid-throw: once restocked we must go BACK to the pit,
+                    // not on to the cargo flow, or the throw is silently skipped
+                    afterRestock = MoverState.MOVE_TO_THROW;
+                    setState(MoverState.RESTOCK_PEARLS);
                 }
-                if (trapdoorPos != null && !isTrapdoorOpen()) {
-                    warn("Trapdoor closed, reopening before the throw");
-                    setState(MoverState.OPEN_TRAPDOOR);
-                    return;
-                }
-                if (!throwPathClear()) {
-                    if (stateTicks % 20 == 0) {
-                        info("THROWING waiting: throw path not clear (waited={} ticks, limit={})",
-                            stateTicks, config.pathTimeoutTicks);
-                    }
-                    if (stateTicks > config.pathTimeoutTicks) {
-                        error("Throw path is blocked and cannot be cleared");
-                        setState(MoverState.ERROR);
-                    }
-                    return;
-                }
-                pearlIdsBeforeThrow = currentPearlIds();
-                throwRetries = 0;
-                throwTicks = 0;
-                moveToThrowRetries = 0;
-                restingPearlId = -1;
-                pearlStayTicks = 0;
-                throwStep = 1;
+                return;
             }
-            case 1 -> {
-                if (isStuckInBlock()) {
-                    setState(MoverState.EXIT_WATER);
-                    return;
-                }
-                if (!readyToThrow()) {
-                    dbg("Not at the throw position yet, pathing back to the pit");
-                    setState(MoverState.MOVE_TO_THROW);
-                    return;
-                }
-                if (trapdoorPos != null && !isTrapdoorOpen()) {
-                    warn("Trapdoor closed before the throw, reopening");
-                    setState(MoverState.OPEN_TRAPDOOR);
-                    return;
-                }
-                // throw straight down (pitch=90) from within the throw range
-                lastAim = new float[]{lastAim[0], 90f};
-                var dp = CACHE.getPlayerCache();
-                double hdx = (currentPit[0] + 0.5) - dp.getX();
-                double hdz = (currentPit[2] + 0.5) - dp.getZ();
-                info("Throwing pearl straight down at pit {} | bot=({},{},{}) eyeY={} | hOff=({},{}) hDist={} | yaw={} pitch=90",
-                    fmt(currentPit),
-                    String.format("%.2f", dp.getX()), String.format("%.2f", dp.getY()), String.format("%.2f", dp.getZ()),
-                    String.format("%.2f", dp.getEyeY()),
-                    String.format("%.2f", hdx), String.format("%.2f", hdz),
-                    String.format("%.2f", Math.sqrt(hdx * hdx + hdz * hdz)),
-                    String.format("%.1f", lastAim[0]));
-                submitInput(Input.builder()
-                    .rightClick(true)
-                    .clickTarget(ClickTarget.None.INSTANCE)
-                    .clickRequiresRotation(false)
-                    .build(), lastAim[0], 90f);
-                throwStep = 2;
-                throwTicks = 0;
+            if (!INVENTORY.hasActiveRequest()) {
+                submitMovePearlToHotbar();
             }
-            case 2 -> {
-                throwTicks++;
-                if (throwTicks >= 2) {
-                    submitInput(Input.builder().build(), lastAim[0], lastAim[1]);
-                }
-                if (isStuckInBlock()) {
-                    setState(MoverState.EXIT_WATER);
-                    return;
-                }
-                int pid = ownNewPearlIdNearPit();
-                if (pid != -1) {
-                    Entity pe = CACHE.getEntityCache().get(pid);
-                    info("Pearl entered the pit and is falling clear, retreating"
-                            + " | pearl=({},{},{}) dy={}",
-                        pe == null ? "?" : String.format("%.2f", pe.getX()),
-                        pe == null ? "?" : String.format("%.2f", pe.getY()),
-                        pe == null ? "?" : String.format("%.2f", pe.getZ()),
-                        pe == null ? "?" : String.format("%.2f", pe.getY() - currentPit[1]));
-                    restingPearlId = pid;
-                    pearlStayTicks = 0;
-                    throwStep = 3;
-                    throwTicks = 0;
-                } else if (throwTicks > THROW_DETECT_TICKS) {
-                    if (++throwRetries > MAX_THROW_RETRIES) {
-                        error("Pearl throw not confirmed after retries");
-                        setState(MoverState.ERROR);
-                    } else {
-                        var dp2 = CACHE.getPlayerCache();
-                        warn("Pearl throw not confirmed, retrying ({}) | bot=({},{},{}) lastAim=({},{})",
-                            throwRetries,
-                            String.format("%.2f", dp2.getX()), String.format("%.2f", dp2.getY()), String.format("%.2f", dp2.getZ()),
-                            String.format("%.1f", lastAim[0]), String.format("%.1f", lastAim[1]));
-                        pearlIdsBeforeThrow = currentPearlIds();
-                        throwStep = 1;
-                        throwTicks = 0;
-                    }
-                }
+            if (stateTicks % 20 == 0) {
+                info("THROWING waiting: pearl not in the held slot (anyPearl={} requestActive={} waited={} ticks)",
+                    hasAnyPearl(), INVENTORY.hasActiveRequest(), stateTicks);
             }
-            case 3 -> {
-                if (++throwTicks >= THROW_FINISH_TICKS) {
-                    throwStep = 0;
-                    BARITONE.stop();
-                    info("Pearl confirmed in pit, entering RETREAT");
-                    setState(MoverState.RETREAT);
-                }
-            }
-            default -> {
-                throwStep = 0;
-                setState(MoverState.RETREAT);
-            }
+            return;
         }
+        if (trapdoorPos != null && !isTrapdoorOpen()) {
+            warn("Trapdoor closed, reopening before the throw");
+            setState(MoverState.OPEN_TRAPDOOR);
+            return;
+        }
+        if (!throwPathClear()) {
+            if (stateTicks % 20 == 0) {
+                info("THROWING waiting: throw path not clear (waited={} ticks, limit={})",
+                    stateTicks, config.pathTimeoutTicks);
+            }
+            if (stateTicks > config.pathTimeoutTicks) {
+                error("Throw path is blocked and cannot be cleared");
+                setState(MoverState.ERROR);
+            }
+            return;
+        }
+        pearlIdsBeforeThrow = currentPearlIds();
+        throwRetries = 0;
+        moveToThrowRetries = 0;
+        restingPearlId = -1;
+        pearlStayTicks = 0;
+        setState(MoverState.THROW_PEARL);
+    }
+
+    /** The single right-click of the round: straight down (pitch 90) from the throw stand. */
+    private void handleThrowPearl() {
+        if (isStuckInBlock()) {
+            setState(MoverState.EXIT_WATER);
+            return;
+        }
+        if (!readyToThrow()) {
+            dbg("Not at the throw position yet, pathing back to the pit");
+            setState(MoverState.MOVE_TO_THROW);
+            return;
+        }
+        if (trapdoorPos != null && !isTrapdoorOpen()) {
+            warn("Trapdoor closed before the throw, reopening");
+            setState(MoverState.OPEN_TRAPDOOR);
+            return;
+        }
+        lastAim = new float[]{lastAim[0], 90f};
+        var dp = CACHE.getPlayerCache();
+        double hdx = (currentPit[0] + 0.5) - dp.getX();
+        double hdz = (currentPit[2] + 0.5) - dp.getZ();
+        info("Throwing pearl straight down at pit {} | bot=({},{},{}) eyeY={} | hOff=({},{}) hDist={} | yaw={} pitch=90",
+            fmt(currentPit),
+            String.format("%.2f", dp.getX()), String.format("%.2f", dp.getY()), String.format("%.2f", dp.getZ()),
+            String.format("%.2f", dp.getEyeY()),
+            String.format("%.2f", hdx), String.format("%.2f", hdz),
+            String.format("%.2f", Math.sqrt(hdx * hdx + hdz * hdz)),
+            String.format("%.1f", lastAim[0]));
+        submitInput(Input.builder()
+            .rightClick(true)
+            .clickTarget(ClickTarget.None.INSTANCE)
+            .clickRequiresRotation(false)
+            .build(), lastAim[0], 90f);
+        awaitPearlSpawnTimer.reset();
+        setState(MoverState.AWAIT_PEARL_SPAWNED);
+    }
+
+    /**
+     * Wait for our own pearl entity to show up inside the pit column. A throw that never
+     * spawns is a rejected click or a lag spike, and re-clicking is cheap compared with
+     * walking all the way back in, so retry the click while the budget lasts.
+     */
+    private void handleAwaitPearlSpawned() {
+        if (isStuckInBlock()) {
+            setState(MoverState.EXIT_WATER);
+            return;
+        }
+        int pid = ownNewPearlIdNearPit();
+        if (pid != -1) {
+            Entity pe = CACHE.getEntityCache().get(pid);
+            info("Pearl entered the pit and is falling clear | pearl=({},{},{}) dy={}",
+                pe == null ? "?" : String.format("%.2f", pe.getX()),
+                pe == null ? "?" : String.format("%.2f", pe.getY()),
+                pe == null ? "?" : String.format("%.2f", pe.getZ()),
+                pe == null ? "?" : String.format("%.2f", pe.getY() - currentPit[1]));
+            restingPearlId = pid;
+            pearlStayTicks = 0;
+            retreatStableTicks = 0;
+            pearlRiseInit = false;
+            awaitThrowSettleTimer.reset();
+            setState(MoverState.AWAIT_THROW_SETTLE);
+            return;
+        }
+        if (!awaitPearlSpawnTimer.tick(THROW_DETECT_TICKS)) return;
+        if (++throwRetries > MAX_THROW_RETRIES) {
+            error("Pearl throw not confirmed after {} attempts", MAX_THROW_RETRIES);
+            setState(MoverState.ERROR);
+            return;
+        }
+        var dp2 = CACHE.getPlayerCache();
+        warn("Pearl throw not confirmed after {} ticks, throwing again ({}/{}) | bot=({},{},{}) lastAim=({},{})",
+            THROW_DETECT_TICKS, throwRetries, MAX_THROW_RETRIES,
+            String.format("%.2f", dp2.getX()), String.format("%.2f", dp2.getY()), String.format("%.2f", dp2.getZ()),
+            String.format("%.1f", lastAim[0]), String.format("%.1f", lastAim[1]));
+        pearlIdsBeforeThrow = currentPearlIds();
+        setState(MoverState.THROW_PEARL);
+    }
+
+    /**
+     * Let go of the right-click for a couple of ticks before moving. Walking into a pearl
+     * that is still rising in the column is what triggers it on us - so the short pause is
+     * deliberate, not a rounding error.
+     */
+    private void handleAwaitThrowSettle() {
+        if (!awaitThrowSettleTimer.tick(THROW_FINISH_TICKS)) return;
+        submitInput(Input.builder().build(), lastAim[0], lastAim[1]);
+        info("Pearl confirmed in pit, entering RETREAT");
+        setState(MoverState.RETREAT);
     }
 
     /**
@@ -1958,22 +2068,43 @@ private boolean inPitFootprint() {
     }
 
 /**
-     * How many ender pearls are sitting in the chamber right now, ours or anybody's.
-     *
-     * <p>A chamber that already holds a pearl is stocked - that is the one the loader bot uses
-     * to pull us - so there is nothing to gain from throwing another one.
+     * Ender pearls in the chamber that belong to us. This answers "do we already have cargo
+     * waiting for the loader bot on this side?" - somebody else's pearl is not ours to use, and
+     * is not evidence that this round is stocked.
+     */
+    private int ownPearlsInPit() {
+        return ownPearlsInChamber(currentPit);
+    }
+
+    /** Same question as {@link #ownPearlsInPit()}, for a chamber other than the current one. */
+    private int ownPearlsInChamber(int[] pit) {
+        if (pit == null) return 0;
+        int selfId = CACHE.getPlayerCache().getEntityId();
+        int n = 0;
+        for (Entity e : CACHE.getEntityCache().getEntities().values()) {
+            if (e.getEntityType() != EntityType.ENDER_PEARL) continue;
+            if (!(e.getObjectData() instanceof ProjectileData pd) || pd.getOwnerId() != selfId) continue;
+            if (pearlInsidePitColumn(e, pit)) n++;
+        }
+        return n;
+    }
+
+    /**
+     * Ender pearls in the chamber, ours or anybody's. This answers the physical question "is
+     * there already something down there?" - throwing on top of a pearl somebody else parked
+     * would just pile the chamber up, which is how one run once left nine of them in there.
      */
     private int pearlsInPit() {
         if (currentPit == null) return 0;
         int n = 0;
         for (Entity e : CACHE.getEntityCache().getEntities().values()) {
             if (e.getEntityType() != EntityType.ENDER_PEARL) continue;
-            if (!pearlInsidePitColumn(e)) continue;
-            n++;
+            if (pearlInsidePitColumn(e)) n++;
         }
         return n;
     }
 
+    /** One of our own pearls already risen and resting at the pit, so we need not throw. */
     private boolean pearlRestingInPit() {
         int selfId = CACHE.getPlayerCache().getEntityId();
         for (Entity e : CACHE.getEntityCache().getEntities().values()) {
@@ -2019,10 +2150,16 @@ private boolean inPitFootprint() {
      * is what stops a pearl resting on the rim from counting.
  */
     private boolean pearlInsidePitColumn(Entity e) {
-        double dx = Math.abs(e.getX() - (currentPit[0] + 0.5));
-        double dz = Math.abs(e.getZ() - (currentPit[2] + 0.5));
+        return pearlInsidePitColumn(e, currentPit);
+    }
+
+    /** Same horizontal test against an arbitrary chamber column. */
+    private boolean pearlInsidePitColumn(Entity e, int[] pit) {
+        if (pit == null) return false;
+        double dx = Math.abs(e.getX() - (pit[0] + 0.5));
+        double dz = Math.abs(e.getZ() - (pit[2] + 0.5));
         if (dx > PIT_PEARL_COL_DX || dz > PIT_PEARL_COL_DZ) return false;
-        double dy = e.getY() - currentPit[1];
+        double dy = e.getY() - pit[1];
         return dy >= -4.0 && dy <= 9.0;
     }
 
@@ -2079,35 +2216,90 @@ private boolean inPitFootprint() {
     }
 
     /**
-     * Retreat clear of the pit with pure direct input (walk+jump) along the trapdoor's FACING
-     * side for 1-2 blocks - baritone cannot path out of the shaft and would leave us in it.
-     *
-     * <p>Also watches for our own pearl triggering us (the pearl entity vanishing, or a small
-     * coordinate jump); either means we got teleported, so we re-throw and keep retreating.
-     * Cargo may only begin once the pearl has stopped sinking for PEARL_STAY_TICKS.
+     * Walk/jump clear of the pit with pure direct input along the trapdoor's FACING side -
+     * baritone cannot path out of the shaft and would leave us in it. Nothing about the pearl
+     * is decided here; leaving the pit comes first and {@link #handleAwaitPearlStable()} is
+     * the gate into cargo.
      */
     private void handleRetreat() {
-        // collision-trigger detection: small jump or pearl vanished while retreating
+        if (pearlTriggeredOnUs()) return;
         var pc = CACHE.getPlayerCache();
-        if (hasRetreatPrev) {
-            double jumpSq = distSq(pc.getX(), pc.getY(), pc.getZ(), retreatPrevX, retreatPrevY, retreatPrevZ);
-            if (jumpSq > PEARL_TRIGGER_JUMP_SQ) {
-                onPearlTriggeredDuringRetreat("coordinate jump of " + Math.sqrt(jumpSq) + " blocks");
-                return;
-            }
+        if (awayFromPit()) {
+            jumpAssist(false);
+            BARITONE.stop();
+            info("Clear of the pit (dist={}), waiting for the pearl to settle",
+                String.format("%.2f", awayDist()));
+            setState(MoverState.AWAIT_PEARL_STABLE);
+            return;
         }
-        retreatPrevX = pc.getX();
-        retreatPrevY = pc.getY();
-        retreatPrevZ = pc.getZ();
-        hasRetreatPrev = true;
-
-        // pearl stability tracking (counts up while risen+static, resets if lost)
-        if (restingPearlId != -1) {
-            if (!entityExists(restingPearlId)) {
-                // the pearl we confirmed is gone -> it triggered on us (or broke)
-                onPearlTriggeredDuringRetreat("pearl entity disappeared");
-                return;
+        // fell back into the shaft: the walls block any sideways move, so rise through
+        // the open trapdoor first and only then walk off
+        BARITONE.stop();
+        double trapRefY = trapdoorPos != null ? trapdoorPos[1] : currentPit[1];
+        if (pc.getY() < trapRefY - 0.1) {
+            if (stateTicks % 20 == 0) {
+                info("RETREAT: below the pit y={} (trapY={}), floating up in place first",
+                    String.format("%.2f", pc.getY()), String.format("%.0f", trapRefY));
             }
+            // phase 1: float straight up to trapdoor level first - moving sideways while
+            // still inside the shaft would just shove us out of the bubble column
+            submitRiseInput();
+            return;
+        }
+        // phase 2: at trapdoor level, walk away along the trapdoor facing
+        // track horizontal progress; if stuck, rotate through 4 directions
+        double hx = pc.getX() - retreatPrevHx;
+        double hz = pc.getZ() - retreatPrevHz;
+        if (hx * hx + hz * hz < 0.01) {
+            retreatNoProgressTicks++;
+        } else {
+            retreatNoProgressTicks = 0;
+        }
+        retreatPrevHx = pc.getX();
+        retreatPrevHz = pc.getZ();
+        float yaw;
+        if (retreatNoProgressTicks > 40) {
+            // stuck in place: rotate direction every 40 ticks
+            int dir = (retreatNoProgressTicks / 40) % 4;
+            yaw = (float) (dir * 90.0);
+            if (retreatNoProgressTicks % 40 == 1) {
+                info("RETREAT: no progress for {} ticks, trying yaw={}", retreatNoProgressTicks, yaw);
+            }
+        } else {
+            yaw = retreatYaw();
+        }
+        double rdx = pc.getX() - (currentPit[0] + 0.5);
+        double rdz = pc.getZ() - (currentPit[2] + 0.5);
+        if (stateTicks % 10 == 0) {
+            info("RETREAT: bot=({},{},{}) dist={} yaw={} yawAway={} yawFacing={}",
+                String.format("%.2f", pc.getX()), String.format("%.2f", pc.getY()),
+                String.format("%.2f", pc.getZ()),
+                String.format("%.2f", Math.sqrt(rdx * rdx + rdz * rdz)),
+                String.format("%.1f", yaw),
+                String.format("%.1f", retreatYaw()),
+                String.format("%.1f", retreatYawFacing()));
+        }
+        // stand up and step back away from the hole; yaw is rotated when stuck so the
+        // "try another way out" fallback actually changes the direction
+        submitInput(Input.builder()
+            .pressingForward(true)
+            .jumping(true)
+            .build(), yaw, 0f);
+        jumpHeld = true; // released once we are out
+        if (awaitRetreatTimer.tick(RETREAT_STABLE_TIMEOUT_TICKS)) {
+            rethrowOrHalt("never got clear of the pit");
+        }
+    }
+
+    /**
+     * Gate into the next phase: the pearl has to have stopped sinking for
+     * {@link #PEARL_STAY_TICKS} while we stand clear of the pit. "Stopped sinking" covers both
+     * being lifted back up and already resting against the sign above the trapdoor.
+     */
+    private void handleAwaitPearlStable() {
+        if (pearlTriggeredOnUs()) return;
+
+        if (restingPearlId != -1) {
             pearlMissingTicks = 0;
             // "settled" only means the pearl turned around at the bottom of the pit and is
             // on its way back up - there is no need to wait for it to reach the trapdoor.
@@ -2115,9 +2307,6 @@ private boolean inPitFootprint() {
             if (pe != null && pearlInsidePitColumn(pe)) {
                 double y = pe.getY();
                 if (pearlRiseInit) {
-                    // "settled" = the pearl has stopped sinking. It is either still being
-                    // lifted back up or already resting against the sign above the
-                    // trapdoor (where it stops moving altogether) - both count.
                     if (y >= pearlLastY - 0.005) retreatStableTicks++;
                     else retreatStableTicks = 0;
                 }
@@ -2134,121 +2323,86 @@ private boolean inPitFootprint() {
                 restingPearlId = pid;
                 pearlMissingTicks = 0;
                 retreatStableTicks = 1;
-            } else {
-                pearlMissingTicks++;
+            } else if (++pearlMissingTicks > THROW_DETECT_TICKS) {
                 // pearl never appeared after the throw window -> re-throw
-                if (pearlMissingTicks > THROW_DETECT_TICKS && throwRetries < MAX_THROW_RETRIES) {
-                    onPearlTriggeredDuringRetreat("pearl never appeared");
-                    return;
-                }
+                onPearlTriggeredDuringRetreat("pearl never appeared");
+                return;
             }
         }
 
-        boolean stable = retreatStableTicks >= PEARL_STAY_TICKS;
-        boolean timedOut = stateTicks > RETREAT_STABLE_TIMEOUT_TICKS;
-        // Entering cargo/unload needs BOTH: the pearl confirmed settled in the chamber AND the bot
-        // safely clear of the pit. Stability is only ever checked here, as the gate into the
-        // next phase - never as a reason to start or skip the retreat.
-        if (!stable && timedOut) {
-            // no confirmed pearl in the chamber (throw missed, or it triggered on us):
-            // never carry on to cargo/unload without one - re-throw instead
-            if (++rethrowCount > MAX_THROW_RETRIES) {
-                error("No pearl confirmed in the pit after {} re-throws - halting",
-                    MAX_THROW_RETRIES);
-                jumpAssist(false);
-                setState(MoverState.ERROR);
-                return;
+        if (!awayFromPit()) {
+            // shoved back into the shaft (a hop off the lid can do that): climb out again
+            if (!retreatLeaveWarned) {
+                retreatLeaveWarned = true;
+                warn("Back in the pit while waiting for the pearl, leaving again before {}",
+                    isInput() ? "cargo" : "unload");
             }
-            warn("Pearl not confirmed in the pit after {} ticks, re-throwing ({}/{}) | pearlsLeft={}",
-                RETREAT_STABLE_TIMEOUT_TICKS, rethrowCount, MAX_THROW_RETRIES, pearlCount());
-            jumpAssist(false);
-            BARITONE.stop();
-            restingPearlId = -1;
-            pearlMissingTicks = 0;
-            retreatStableTicks = 0;
-            retreatLeaveWarned = false;
-            hasRetreatPrev = false;
-            pearlRiseInit = false;
-            throwStep = 0;
-            throwTicks = 0;
-            pearlIdsBeforeThrow.clear();
-            setState(MoverState.MOVE_TO_THROW);
+            setState(MoverState.RETREAT);
             return;
         }
-        if (stable && awayFromPit()) {
-            info("Pearl settled in the chamber and we are clear of the pit (dist={}), proceeding to {}",
-                String.format("%.2f", awayDist()), isInput() ? "cargo" : "unload");
+        if (retreatStableTicks >= PEARL_STAY_TICKS) {
+            info("Pearl settled in the chamber ({} stable ticks) and we are clear of the pit (dist={}), proceeding to {}",
+                retreatStableTicks, String.format("%.2f", awayDist()), isInput() ? "cargo" : "unload");
             finishRetreat();
             return;
         }
-        if (stable && !awayFromPit() && !retreatLeaveWarned) {
-            retreatLeaveWarned = true;
-            warn("Pearl is settled but we are still in the pit, leaving before {}",
-                isInput() ? "cargo" : "unload");
+        if (stateTicks % 20 == 0) {
+            dbg("AWAIT_PEARL_STABLE: {}/{} ticks without sinking | pearl={}",
+                retreatStableTicks, PEARL_STAY_TICKS, restingPearlId);
         }
+        if (awaitPearlStableTimer.tick(RETREAT_STABLE_TIMEOUT_TICKS)) {
+            rethrowOrHalt("pearl not confirmed in the chamber");
+        }
+    }
 
-        // pure-input retreat: walk+jump away from the pit until we are ~1 block clear.
-        // Never baritone.
-        if (!awayFromPit()) {
-            BARITONE.stop();
-            // fell back into the shaft: the walls block any sideways move, so rise through
-            // the open trapdoor first and only then walk off
-            double trapRefY = trapdoorPos != null ? trapdoorPos[1] : currentPit[1];
-            if (pc.getY() < trapRefY - 0.1) {
-                if (stateTicks % 20 == 0) {
-                    info("RETREAT: below the pit y={} (trapY={}), floating up in place first",
-                        String.format("%.2f", pc.getY()), String.format("%.0f", trapRefY));
-                }
-                // phase 1: float straight up to trapdoor level first - moving sideways while
-                // still inside the shaft would just shove us out of the bubble column
-                submitRiseInput();
-                return;
+    /**
+     * Watches for the pearl firing on us - a small coordinate jump, or the pearl we were
+     * tracking vanishing. Either means we are about to be pulled somewhere else, so the round
+     * starts over instead of carrying on with stale state.
+     *
+     * @return true when it fired and the caller must stop handling this tick
+     */
+    private boolean pearlTriggeredOnUs() {
+        var pc = CACHE.getPlayerCache();
+        if (hasRetreatPrev) {
+            double jumpSq = distSq(pc.getX(), pc.getY(), pc.getZ(), retreatPrevX, retreatPrevY, retreatPrevZ);
+            if (jumpSq > PEARL_TRIGGER_JUMP_SQ) {
+                onPearlTriggeredDuringRetreat("coordinate jump of " + Math.sqrt(jumpSq) + " blocks");
+                return true;
             }
-            // phase 2: at trapdoor level, walk away along the trapdoor facing
-            // track horizontal progress; if stuck, rotate through 4 directions
-            double hx = pc.getX() - retreatPrevHx;
-            double hz = pc.getZ() - retreatPrevHz;
-            if (hx * hx + hz * hz < 0.01) {
-                retreatNoProgressTicks++;
-            } else {
-                retreatNoProgressTicks = 0;
-            }
-            retreatPrevHx = pc.getX();
-            retreatPrevHz = pc.getZ();
-            float yaw;
-            if (retreatNoProgressTicks > 40) {
-                // stuck in place: rotate direction every 40 ticks
-                int dir = (retreatNoProgressTicks / 40) % 4;
-                yaw = (float) (dir * 90.0);
-                if (retreatNoProgressTicks % 40 == 1) {
-                    info("RETREAT: no progress for {} ticks, trying yaw={}", retreatNoProgressTicks, yaw);
-                }
-            } else {
-                yaw = retreatYaw();
-            }
-            double rdx = pc.getX() - (currentPit[0] + 0.5);
-            double rdz = pc.getZ() - (currentPit[2] + 0.5);
-            if (stateTicks % 10 == 0) {
-                info("RETREAT: bot=({},{},{}) dist={} yaw={} yawAway={} yawFacing={} stable={}/{}",
-                    String.format("%.2f", pc.getX()), String.format("%.2f", pc.getY()),
-                    String.format("%.2f", pc.getZ()),
-                    String.format("%.2f", Math.sqrt(rdx * rdx + rdz * rdz)),
-                    String.format("%.1f", yaw),
-                    String.format("%.1f", retreatYaw()),
-                    String.format("%.1f", retreatYawFacing()),
-                    retreatStableTicks, PEARL_STAY_TICKS);
-            }
-            // stand up and step back away from the hole; yaw is rotated when stuck so the
-            // "try another way out" fallback actually changes the direction
-            submitInput(Input.builder()
-                .pressingForward(true)
-                .jumping(true)
-                .build(), yaw, 0f);
-            jumpHeld = true; // release later via jumpAssist(false) once out
+        }
+        retreatPrevX = pc.getX();
+        retreatPrevY = pc.getY();
+        retreatPrevZ = pc.getZ();
+        hasRetreatPrev = true;
+        if (restingPearlId != -1 && !entityExists(restingPearlId)) {
+            // the pearl we confirmed is gone -> it triggered on us (or broke)
+            onPearlTriggeredDuringRetreat("pearl entity disappeared");
+            return true;
+        }
+        return false;
+    }
+
+    /** The pearl never confirmed in the chamber: throw again, or halt once the budget is spent. */
+    private void rethrowOrHalt(String why) {
+        if (++rethrowCount > MAX_THROW_RETRIES) {
+            error("{} - halting after {} re-throws", why, MAX_THROW_RETRIES);
+            jumpAssist(false);
+            setState(MoverState.ERROR);
             return;
         }
-        // clear of the pit: stop walking, keep only jump assist while still in liquid
-        jumpAssist(inLiquid());
+        warn("{} after {} ticks, re-throwing ({}/{}) | pearlsLeft={}",
+            why, RETREAT_STABLE_TIMEOUT_TICKS, rethrowCount, MAX_THROW_RETRIES, pearlCount());
+        jumpAssist(false);
+        BARITONE.stop();
+        restingPearlId = -1;
+        pearlMissingTicks = 0;
+        retreatStableTicks = 0;
+        retreatLeaveWarned = false;
+        hasRetreatPrev = false;
+        pearlRiseInit = false;
+        pearlIdsBeforeThrow.clear();
+        setState(MoverState.MOVE_TO_THROW);
     }
 
     /**
@@ -2342,8 +2496,6 @@ private boolean inPitFootprint() {
         retreatStableTicks = 0;
         retreatLeaveWarned = false;
         hasRetreatPrev = false;
-        throwStep = 0;
-        throwTicks = 0;
         pearlIdsBeforeThrow.clear();
         setState(MoverState.MOVE_TO_THROW);
     }
@@ -2353,6 +2505,13 @@ private boolean inPitFootprint() {
         hasRetreatPrev = false;
         retreatLeaveWarned = false;
         rethrowCount = 0;
+        // clear the stability tracking so the next chamber starts counting from zero - the
+        // detour throw for a neighbouring chamber runs a second round in the same visit
+        retreatStableTicks = 0;
+        pearlStayTicks = 0;
+        pearlMissingTicks = 0;
+        pearlRiseInit = false;
+        restingPearlId = -1;
         if (detourPending) {
             // That throw stocked the neighbouring chamber we were pulled into. Put the real
             // configured pit back and walk over to it for the actual round.
@@ -2364,6 +2523,15 @@ private boolean inPitFootprint() {
             detourTrapdoor = null;
             detourPending = false;
             pitEscapeTicks = 0;
+            int stocked = ownPearlsInChamber(currentPit);
+            if (stocked > 0) {
+                // our pearl from the previous round is still sitting there: nothing to throw,
+                // go straight on to the restock/cargo flow instead of walking over for nothing
+                info("Configured pit {} already holds {} of our pearls - no throw needed, going on to {}",
+                    fmt(currentPit), stocked, isInput() ? "cargo" : "unload");
+                setState(MoverState.RESTOCK_PEARLS);
+                return;
+            }
             setState(MoverState.MOVE_TO_THROW);
             return;
         }
@@ -2882,7 +3050,7 @@ private boolean inPitFootprint() {
         } else {
             // ender chest -> main inventory (bulk shift-click, one request)
             if (firstNonEmpty(c, 0, chestEnd, s -> true) == -1) {
-                // echest is empty 闁?but before whispering, make sure the main
+                // echest is empty - but before whispering, make sure the main
                 // inventory has no leftover cargo we just withdrew; deposit it first
                 if (firstNonEmpty(c, mainStart, mainEnd, this::isCargo) != -1) {
                     info("Echest emptied, depositing remaining cargo before whispering");
@@ -2942,15 +3110,21 @@ private boolean inPitFootprint() {
         else config.inputBot = name;
         String cmd = "/w " + name + " tp";
         var p = CACHE.getPlayerCache();
+        sendClientPacketAsync(new ServerboundChatPacket(cmd));
+        info("Sent teleport command: {} (whispering the {} side's pearl bot to pull us there)", cmd, atInput ? "output" : "input");
         tpPrevX = p.getX();
         tpPrevY = p.getY();
         tpPrevZ = p.getZ();
-        sendClientPacketAsync(new ServerboundChatPacket(cmd));
-        info("Sent teleport command: {} (whispering the {} side's pearl bot to pull us there)", cmd, atInput ? "output" : "input");
-        setState(MoverState.WAIT_TELEPORT);
+        setState(MoverState.AWAIT_TELEPORT);
     }
 
-    private void handleWaitTeleport() {
+    /**
+     * Wait for the coordinate jump that confirms the pull. The whisper is repeated while the
+     * bot is still standing where it whispered - the loader bot sometimes receives the message
+     * and does nothing (its own pearl spot empty or in use), and silence there used to look
+     * exactly like a slow teleport.
+     */
+    private void handleAwaitTeleport() {
         var p = CACHE.getPlayerCache();
         double d2 = distSq(p.getX(), p.getY(), p.getZ(), tpPrevX, tpPrevY, tpPrevZ);
         if (d2 > (double) config.tpDetectDistance * config.tpDetectDistance) {
@@ -2963,14 +3137,22 @@ private boolean inPitFootprint() {
             setState(MoverState.START);
             return;
         }
-        if (stateTicks > config.teleportTimeoutTicks) {
-            if (tpRetries++ < MAX_TP_RETRIES) {
-                warn("Teleport timeout, retrying whisper ({})", tpRetries);
-                setState(MoverState.WHISPER);
-            } else {
-                warn("Teleport failed after retries");
-                setState(MoverState.ERROR);
+        if (!awaitTeleportTimer.tick(config.teleportTimeoutTicks)) {
+            if (stateTicks % 100 == 0) {
+                dbg("Waiting for the pull ({}/{} ticks, whisper {}/{})",
+                    stateTicks, config.teleportTimeoutTicks, tpRetries, MAX_TP_RETRIES);
             }
+            return;
+        }
+        // timeout: the previous whisper did nothing. Ask again from the same spot, keeping
+        // tpPrev* in sync so the next wait measures from here.
+        if (tpRetries++ < MAX_TP_RETRIES) {
+            warn("Teleport timeout after {} ticks, whispering again ({}/{})", config.teleportTimeoutTicks, tpRetries, MAX_TP_RETRIES);
+            setState(MoverState.WHISPER);
+        } else {
+            error("Teleport failed after {} whispers - the pearl bot on the other side is not pulling us (check its pearl spot)",
+                MAX_TP_RETRIES);
+            setState(MoverState.ERROR);
         }
     }
 

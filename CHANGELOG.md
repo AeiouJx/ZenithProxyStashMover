@@ -5,7 +5,31 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [Unreleased]
+
+### Changed
+
+- The pearl round is now a chain of explicit `GO_*` / `AWAIT_*` state pairs, the same shape the
+  villager trader plugin uses: `OPEN_TRAPDOOR → AWAIT_TRAPDOOR_OPEN`, `THROW_PEARL →
+  AWAIT_PEARL_SPAWNED → AWAIT_THROW_SETTLE`, `RETREAT → AWAIT_PEARL_STABLE`, `WHISPER →
+  AWAIT_TELEPORT`. Each awaited step times out on its own `Timers.tickTimer()`, reset by
+  `setState`, instead of sharing one bare tick counter with unrelated branches.
+- `THROWING` is now only the pre-flight check (pearl in hand, lid open, drop path clear); the
+  actual right-click lives in `THROW_PEARL`, so a rejected click is retried on its own.
+- `START` is a pure entry point that clears the per-visit variables; deciding the side and the
+  512-block position fallback moved to the new `EVAL_SIDE` state.
+- Chamber detection on arrival reads the bubble column the bot is standing in, instead of
+  guessing from the distance to the configured pit.
+
+### Fixed
+
+- A side normally has two pearl chambers, but the neighbouring-chamber restock only triggered
+  beyond 8 blocks, so a pair sitting 4 blocks apart never got restocked.
+- Landing on the rim of a chamber could pick the bot's own column as "the neighbouring chamber".
+- Pearl ownership is now explicit in the code: whether a throw is needed counts only our own
+  pearls, while the "do not throw into an occupied chamber" check still counts anybody's.
+
+## [1.0.0] - 2026-10-15
 
 First public release.
 

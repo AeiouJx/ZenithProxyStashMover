@@ -26,15 +26,18 @@ StashMover uses this in both directions:
    pearl and pulls this bot across.
 5. Repeat.
 
-If the pull lands the bot in the wrong chamber, it restocks that chamber on the way past before
-heading to the configured one, so the loader always has a loaded pearl to work with.
+If the pull lands the bot in a neighbouring chamber instead of the configured pit - most sides
+have two - it recognises the bubble column it is standing in, climbs out through that chamber's
+trapdoor, throws a pearl into it and only then walks over to the configured pit. That keeps
+every chamber the loader bot might use loaded.
 
 ## Requirements
 
 - Java 21+
 - [ZenithProxy](https://github.com/rfresh2/ZenithProxy) on the `java` release channel
   (plugins are not supported on `linux`)
-- Two static chambers, one per side, each built around a bubble column with an openable trapdoor
+- Two static chambers, one per side, each built around a bubble column with an openable trapdoor.
+  A side with two chambers is supported: the bot works out which one it landed in.
 - Two loader bots, one standing at each chamber
 - Optionally an ender chest and a pearl restock chest near each side
 
