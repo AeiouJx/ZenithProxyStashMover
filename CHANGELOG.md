@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-27
+
 ### Changed
 
 - The pearl round is now a chain of explicit `GO_*` / `AWAIT_*` state pairs, the same shape the
